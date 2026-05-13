@@ -362,6 +362,31 @@ def bone_transform_source_props(armature, driver_records):
     return refs, transform_drivers
 
 
+def constraint_source_props(driver_records):
+    refs = set()
+    constraint_drivers = []
+    for record in driver_records:
+        pose_path = record["pose_path"]
+        if not pose_path:
+            continue
+        if pose_path["channel_base"] != "constraints":
+            continue
+
+        refs.update(record["source_props"])
+        constraint_drivers.append(
+            {
+                "data_path": record["data_path"],
+                "array_index": record["array_index"],
+                "source_props": sorted(record["source_props"]),
+            }
+        )
+    return refs, constraint_drivers
+
+
+def is_protected_prop_name(name):
+    return name.startswith("Mha")
+
+
 def ancestor_props(seed_props, reverse_edges):
     found = set(seed_props)
     queue = deque(seed_props)
@@ -395,8 +420,10 @@ def build_classification(armature):
 
     shape_seeds, shape_drivers = shape_key_source_props(armature)
     bone_seeds, transform_drivers = bone_transform_source_props(armature, object_drivers)
+    constraint_seeds, constraint_drivers = constraint_source_props(object_drivers)
     shape_touched = ancestor_props(shape_seeds, reverse_edges)
     bone_touched = ancestor_props(bone_seeds, reverse_edges)
+    constraint_touched = ancestor_props(constraint_seeds, reverse_edges)
 
     controls = []
     internal_delete_props = []
@@ -404,11 +431,14 @@ def build_classification(armature):
     for key, prop_def in sorted(prop_defs.items()):
         reaches_bones = key in bone_touched
         reaches_shape_keys = key in shape_touched
+        reaches_constraints = key in constraint_touched
         is_driven = key in driven_props
+        is_protected = reaches_constraints or is_protected_prop_name(prop_def["name"])
         is_control = (
             (reaches_bones or reaches_shape_keys)
             and not is_driven
             and prop_def["is_numeric_scalar"]
+            and not is_protected
         )
 
         entry = dict(prop_def)
@@ -417,12 +447,16 @@ def build_classification(armature):
                 "key": key,
                 "reaches_bones": reaches_bones,
                 "reaches_shape_keys": reaches_shape_keys,
+                "reaches_constraints": reaches_constraints,
+                "is_protected": is_protected,
                 "is_driven": is_driven,
             }
         )
 
         if is_control:
             controls.append(entry)
+        elif is_protected:
+            protected_props.append(entry)
         elif reaches_bones or reaches_shape_keys:
             internal_delete_props.append(entry)
 
@@ -433,10 +467,12 @@ def build_classification(armature):
         "protected_props": protected_props,
         "bone_touched_props": sorted(bone_touched),
         "shape_touched_props": sorted(shape_touched),
+        "constraint_touched_props": sorted(constraint_touched),
         "driven_props": sorted(driven_props),
         "prop_driver_records": all_prop_drivers,
         "shape_drivers": shape_drivers,
         "transform_drivers": transform_drivers,
+        "constraint_drivers": constraint_drivers,
     }
 
 
@@ -447,6 +483,7 @@ def sorted_debug_prop_list(items):
 
 def debug_property_lists(classification):
     classified_props = classification["controls"] + classification["internal_delete_props"]
+    protected_props = classification["protected_props"]
     bone_only = [
         item
         for item in classified_props
@@ -467,6 +504,7 @@ def debug_property_lists(classification):
         "bone_morphs": sorted_debug_prop_list(bone_only),
         "mixed_morphs": sorted_debug_prop_list(mixed),
         "shapekey_morphs": sorted_debug_prop_list(shape_key_only),
+        "protected_props": sorted_debug_prop_list(protected_props),
     }
 
 
@@ -480,8 +518,10 @@ def print_debug_property_lists(armature, classification, baked):
         "bone_morph_props": len(debug_lists["bone_morphs"]),
         "mixed_morph_props": len(debug_lists["mixed_morphs"]),
         "shapekey_morph_props": len(debug_lists["shapekey_morphs"]),
+        "protected_props": len(debug_lists["protected_props"]),
         "shape_key_drivers": len(classification["shape_drivers"]),
         "bone_transform_drivers": len(classification["transform_drivers"]),
+        "constraint_drivers": len(classification["constraint_drivers"]),
     }
 
     print(f"\n[Daz MHX V2] Classification for {armature.name}")
@@ -493,6 +533,7 @@ def print_debug_property_lists(armature, classification, baked):
         ("Bone morphs", debug_lists["bone_morphs"]),
         ("Mixed morphs", debug_lists["mixed_morphs"]),
         ("Shapekey morphs", debug_lists["shapekey_morphs"]),
+        ("Protected props", debug_lists["protected_props"]),
     ):
         print(f"[Daz MHX V2] {label} ({len(names)}):")
         for name in names:
