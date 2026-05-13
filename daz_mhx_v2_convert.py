@@ -4,7 +4,6 @@ import re
 from collections import defaultdict, deque
 
 import bpy
-from bpy.app.handlers import persistent
 from mathutils import Matrix, Quaternion, Vector
 
 
@@ -26,6 +25,8 @@ SAFE_CHANNELS = {"location", "rotation_euler", "rotation_quaternion", "scale"}
 
 _RUNTIME_CACHES = {}
 _APPLYING = False
+_SUPPRESS_RNA_UPDATE = False
+_RNA_CONTROL_PROPS = set()
 
 
 def selected_armature(context):
@@ -52,9 +53,17 @@ def runtime_key_for_armature(armature, path):
     return (armature.as_pointer(), path)
 
 
-def id_prop_path(name):
-    escaped = name.replace("\\", "\\\\").replace('"', '\\"')
-    return f'["{escaped}"]'
+def rna_safe_name(name):
+    safe = re.sub(r"\W+", "_", name).strip("_")
+    if not safe:
+        safe = "morph"
+    if safe[0].isdigit():
+        safe = f"morph_{safe}"
+    return safe
+
+
+def rna_prop_name(scope, name, index):
+    return f"daz_mhx_v2_{index:04d}_{scope}_{rna_safe_name(name)}"
 
 
 def custom_properties_from_path(data_path):
@@ -746,18 +755,25 @@ def runtime_cache_for_armature(armature, force_reload=False):
         }
 
     morphs = []
-    for morph in data.get("morphs", []):
+    morphs_by_rna = {}
+    for index, morph in enumerate(data.get("morphs", [])):
         scope = morph.get("scope")
         name = morph.get("name")
         id_block = id_block_for_scope(armature, scope)
         if not id_block or name not in id_block:
             continue
 
+        prop_name = rna_prop_name(scope, name, index)
+        label = name if scope == "object" else f"{name} (data)"
+        current_value = id_block.get(name, morph.get("default", 0.0))
+        register_rna_control_prop(prop_name, label, morph.get("ui", {}), current_value)
+
         runtime_morph = {
             "scope": scope,
             "name": name,
             "key": prop_key(scope, name),
             "id_block": id_block,
+            "rna_prop_name": prop_name,
             "last_value": None,
             "poses": {},
         }
@@ -777,6 +793,7 @@ def runtime_cache_for_armature(armature, force_reload=False):
                 "bone_deltas": bone_deltas,
             }
         morphs.append(runtime_morph)
+        morphs_by_rna[prop_name] = runtime_morph
 
     runtime = {
         "path": path,
@@ -784,8 +801,10 @@ def runtime_cache_for_armature(armature, force_reload=False):
         "data": data,
         "neutral_bones": neutral_bones,
         "morphs": morphs,
+        "morphs_by_rna": morphs_by_rna,
     }
     _RUNTIME_CACHES[cache_key] = runtime
+    sync_rna_controls_from_id_props(armature, runtime)
     return runtime
 
 
@@ -797,12 +816,88 @@ def weighted_delta_matrix(delta, factor):
     return Matrix.LocRotScale(loc, rot, scale)
 
 
-def apply_runtime_cache(armature, runtime, force=False):
-    matrices = {
-        bone_name: item["matrix"].copy()
-        for bone_name, item in runtime["neutral_bones"].items()
-    }
+def rna_prop_options_from_ui(ui):
+    if not isinstance(ui, dict):
+        ui = {}
 
+    options = {}
+    for source, target in (
+        ("min", "min"),
+        ("max", "max"),
+        ("soft_min", "soft_min"),
+        ("soft_max", "soft_max"),
+        ("description", "description"),
+        ("precision", "precision"),
+        ("step", "step"),
+    ):
+        if source in ui and ui[source] is not None:
+            options[target] = ui[source]
+    return options
+
+
+def make_rna_update_callback(prop_name):
+    def update(self, context):
+        global _APPLYING
+        if _SUPPRESS_RNA_UPDATE or _APPLYING:
+            return
+        if not self or self.type != "ARMATURE":
+            return
+
+        runtime = runtime_cache_for_armature(self)
+        if not runtime:
+            return
+
+        morph = runtime.get("morphs_by_rna", {}).get(prop_name)
+        if not morph:
+            return
+
+        value = float(getattr(self, prop_name))
+        morph["id_block"][morph["name"]] = value
+
+        _APPLYING = True
+        try:
+            apply_runtime_cache(self, runtime, force=True)
+            if context:
+                context.view_layer.update()
+        finally:
+            _APPLYING = False
+
+    return update
+
+
+def register_rna_control_prop(prop_name, label, ui, default):
+    if hasattr(bpy.types.Object, prop_name):
+        _RNA_CONTROL_PROPS.add(prop_name)
+        return
+
+    kwargs = rna_prop_options_from_ui(ui)
+    kwargs.update(
+        {
+            "name": label,
+            "default": float(default) if numeric_scalar(default) else 0.0,
+            "update": make_rna_update_callback(prop_name),
+        }
+    )
+    setattr(bpy.types.Object, prop_name, bpy.props.FloatProperty(**kwargs))
+    _RNA_CONTROL_PROPS.add(prop_name)
+
+
+def sync_rna_controls_from_id_props(armature, runtime):
+    global _SUPPRESS_RNA_UPDATE
+    _SUPPRESS_RNA_UPDATE = True
+    try:
+        for morph in runtime.get("morphs", []):
+            prop_name = morph.get("rna_prop_name")
+            if not prop_name:
+                continue
+            value = float(morph["id_block"].get(morph["name"], 0.0))
+            setattr(armature, prop_name, value)
+            morph["last_value"] = value
+    finally:
+        _SUPPRESS_RNA_UPDATE = False
+
+
+def apply_runtime_cache(armature, runtime, force=False):
     changed = force
     active = 0
     for morph in runtime["morphs"]:
@@ -812,6 +907,12 @@ def apply_runtime_cache(armature, runtime, force=False):
         morph["last_value"] = value
         if abs(value) <= 0.000001:
             continue
+
+        if active == 0:
+            matrices = {
+                bone_name: item["matrix"].copy()
+                for bone_name, item in runtime["neutral_bones"].items()
+            }
 
         pose_name = "positive" if value > 0.0 else "negative"
         pose = morph["poses"].get(pose_name)
@@ -828,6 +929,12 @@ def apply_runtime_cache(armature, runtime, force=False):
 
     if not changed:
         return 0, active
+
+    if active == 0:
+        matrices = {
+            bone_name: item["matrix"].copy()
+            for bone_name, item in runtime["neutral_bones"].items()
+        }
 
     for bone_name, matrix in matrices.items():
         runtime["neutral_bones"][bone_name]["pose_bone"].matrix_basis = matrix
@@ -847,24 +954,6 @@ def load_or_apply_runtime(armature, force_reload=False, force_apply=False):
         runtime,
         force=force_apply or force_reload,
     )
-
-
-@persistent
-def daz_mhx_v2_depsgraph_handler(scene, depsgraph):
-    global _APPLYING
-    if _APPLYING:
-        return
-
-    _APPLYING = True
-    try:
-        for obj in scene.objects:
-            if obj.type != "ARMATURE":
-                continue
-            if not obj.get("daz_mhx_v2_cache_path"):
-                continue
-            load_or_apply_runtime(obj)
-    finally:
-        _APPLYING = False
 
 
 class DAZMHX_OT_v2_aggressive_convert(bpy.types.Operator):
@@ -994,16 +1083,16 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
                         item.get("scope", ""),
                     ),
                 ):
-                    id_block = morph.get("id_block")
+                    prop_name = morph.get("rna_prop_name")
                     name = morph.get("name")
-                    if not id_block or not name or name not in id_block:
+                    if not prop_name or not name or not hasattr(armature, prop_name):
                         continue
 
                     label = name
                     if morph.get("scope") == "data":
                         label = f"{name} (data)"
                     row = box.row()
-                    row.prop(id_block, id_prop_path(name), text=label, slider=True)
+                    row.prop(armature, prop_name, text=label, slider=True)
             elif armature.get("daz_mhx_v2_cache_path"):
                 layout.label(text="No rebuilt morphs found in cache.")
 
@@ -1019,15 +1108,15 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    if daz_mhx_v2_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(daz_mhx_v2_depsgraph_handler)
 
 
 def unregister():
-    if daz_mhx_v2_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(daz_mhx_v2_depsgraph_handler)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    for prop_name in list(_RNA_CONTROL_PROPS):
+        if hasattr(bpy.types.Object, prop_name):
+            delattr(bpy.types.Object, prop_name)
+    _RNA_CONTROL_PROPS.clear()
     _RUNTIME_CACHES.clear()
 
 
