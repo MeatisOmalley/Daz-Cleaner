@@ -436,6 +436,35 @@ def debug_property_lists(classification):
     }
 
 
+def print_debug_property_lists(armature, classification, baked):
+    debug_lists = debug_property_lists(classification)
+    summary = {
+        "controls": len(classification["controls"]),
+        "baked_morphs": len(baked["morphs"]),
+        "internal_delete_props": len(classification["internal_delete_props"]),
+        "protected_shape_key_props": len(classification["protected_props"]),
+        "bone_morph_props": len(debug_lists["bone_morphs"]),
+        "mixed_morph_props": len(debug_lists["mixed_morphs"]),
+        "shapekey_morph_props": len(debug_lists["shapekey_morphs"]),
+        "shape_key_drivers": len(classification["shape_drivers"]),
+        "bone_transform_drivers": len(classification["transform_drivers"]),
+    }
+
+    print(f"\n[Daz MHX V2] Classification for {armature.name}")
+    print("[Daz MHX V2] Summary:")
+    for key, value in summary.items():
+        print(f"  {key}: {value}")
+
+    for label, names in (
+        ("Bone morphs", debug_lists["bone_morphs"]),
+        ("Mixed morphs", debug_lists["mixed_morphs"]),
+        ("Shapekey morphs", debug_lists["shapekey_morphs"]),
+    ):
+        print(f"[Daz MHX V2] {label} ({len(names)}):")
+        for name in names:
+            print(f"  {name}")
+
+
 def transform_snapshot(pose_bone):
     return {
         "matrix_basis": [list(row) for row in pose_bone.matrix_basis],
@@ -641,7 +670,7 @@ def delete_and_rebuild_props(armature, cache, classification):
 def make_cache(context, armature):
     classification = build_classification(armature)
     baked = bake_controls(context, armature, classification)
-    debug_lists = debug_property_lists(classification)
+    print_debug_property_lists(armature, classification, baked)
     return {
         "schema_version": 2,
         "kind": "daz_mhx_bone_morph_cache",
@@ -649,20 +678,6 @@ def make_cache(context, armature):
         "neutral_driver_bases": baked["neutral_driver_bases"],
         "affected_driver_bones": baked["affected_driver_bones"],
         "morphs": baked["morphs"],
-        "debug": {
-            "summary": {
-                "controls": len(classification["controls"]),
-                "baked_morphs": len(baked["morphs"]),
-                "internal_delete_props": len(classification["internal_delete_props"]),
-                "protected_shape_key_props": len(classification["protected_props"]),
-                "bone_morph_props": len(debug_lists["bone_morphs"]),
-                "mixed_morph_props": len(debug_lists["mixed_morphs"]),
-                "shapekey_morph_props": len(debug_lists["shapekey_morphs"]),
-                "shape_key_drivers": len(classification["shape_drivers"]),
-                "bone_transform_drivers": len(classification["transform_drivers"]),
-            },
-            "property_lists": debug_lists,
-        },
     }, classification
 
 
