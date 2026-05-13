@@ -13,7 +13,7 @@ bl_info = {
     "version": (0, 2, 0),
     "blender": (3, 0, 0),
     "location": "View3D > Sidebar > Daz MHX",
-    "description": "Aggressively convert bone-only MHX custom property morphs to cached driver-bone transforms.",
+    "description": "Convert MHX custom property morphs to cached driver-bone and shape-key values.",
     "category": "Object",
 }
 
@@ -45,7 +45,7 @@ def safe_filename(name):
 def cache_path_for_armature(armature):
     return os.path.join(
         OUTPUT_DIR,
-        f"daz_mhx_bone_morph_cache_{safe_filename(armature.name)}.json",
+        f"daz_mhx_morph_cache_{safe_filename(armature.name)}.json",
     )
 
 
@@ -269,6 +269,42 @@ def shape_key_source_props(armature):
     return refs, drivers
 
 
+def shape_key_identifier(mesh, key_block):
+    return f"{mesh.name}::{key_block.name}"
+
+
+def shape_key_targets(armature):
+    targets = {}
+    for mesh in related_meshes(armature):
+        shape_keys = mesh.data.shape_keys
+        if not shape_keys:
+            continue
+        for key_block in shape_keys.key_blocks:
+            if key_block.name == "Basis":
+                continue
+            key = shape_key_identifier(mesh, key_block)
+            targets[key] = {
+                "mesh": mesh.name,
+                "shape_key": key_block.name,
+                "value": key_block.value,
+            }
+    return targets
+
+
+def snapshot_shape_keys(armature, target_keys=None):
+    targets = shape_key_targets(armature)
+    if target_keys is not None:
+        targets = {
+            key: value
+            for key, value in targets.items()
+            if key in target_keys
+        }
+    return {
+        key: dict(value)
+        for key, value in targets.items()
+    }
+
+
 def copy_transform_links_by_driver_bone(armature):
     links = {}
     for pose_bone in armature.pose.bones:
@@ -370,8 +406,7 @@ def build_classification(armature):
         reaches_shape_keys = key in shape_touched
         is_driven = key in driven_props
         is_control = (
-            reaches_bones
-            and not reaches_shape_keys
+            (reaches_bones or reaches_shape_keys)
             and not is_driven
             and prop_def["is_numeric_scalar"]
         )
@@ -388,10 +423,8 @@ def build_classification(armature):
 
         if is_control:
             controls.append(entry)
-        elif reaches_bones and not reaches_shape_keys:
+        elif reaches_bones or reaches_shape_keys:
             internal_delete_props.append(entry)
-        elif reaches_shape_keys:
-            protected_props.append(entry)
 
     return {
         "prop_defs": prop_defs,
@@ -413,19 +446,20 @@ def sorted_debug_prop_list(items):
 
 
 def debug_property_lists(classification):
+    classified_props = classification["controls"] + classification["internal_delete_props"]
     bone_only = [
         item
-        for item in classification["controls"] + classification["internal_delete_props"]
+        for item in classified_props
         if item.get("reaches_bones") and not item.get("reaches_shape_keys")
     ]
     mixed = [
         item
-        for item in classification["protected_props"]
+        for item in classified_props
         if item.get("reaches_bones") and item.get("reaches_shape_keys")
     ]
     shape_key_only = [
         item
-        for item in classification["protected_props"]
+        for item in classified_props
         if item.get("reaches_shape_keys") and not item.get("reaches_bones")
     ]
 
@@ -442,7 +476,7 @@ def print_debug_property_lists(armature, classification, baked):
         "controls": len(classification["controls"]),
         "baked_morphs": len(baked["morphs"]),
         "internal_delete_props": len(classification["internal_delete_props"]),
-        "protected_shape_key_props": len(classification["protected_props"]),
+        "non_control_morph_props": len(classification["internal_delete_props"]),
         "bone_morph_props": len(debug_lists["bone_morphs"]),
         "mixed_morph_props": len(debug_lists["mixed_morphs"]),
         "shapekey_morph_props": len(debug_lists["shapekey_morphs"]),
@@ -503,6 +537,18 @@ def max_matrix_diff(a, b):
     return max(abs(x - y) for x, y in zip(a_values, b_values))
 
 
+def changed_shape_keys(neutral, posed, threshold=0.000001):
+    changed = {}
+    for key, snapshot in posed.items():
+        neutral_snapshot = neutral.get(key)
+        if not neutral_snapshot:
+            continue
+        if abs(snapshot["value"] - neutral_snapshot["value"]) <= threshold:
+            continue
+        changed[key] = snapshot
+    return changed
+
+
 def sample_value_for_control(control, direction):
     ui = control.get("ui", {})
     if not isinstance(ui, dict):
@@ -548,9 +594,11 @@ def bake_controls(context, armature, classification):
     for control in controls:
         set_prop_value(armature, control["key"], 0.0)
     neutral = snapshot_driver_bones(context, armature, all_driver_bones)
+    neutral_shape_keys_all = snapshot_shape_keys(armature)
 
     morphs = []
     affected_driver_bones = set()
+    affected_shape_keys = set()
     for control in controls:
         key = control["key"]
         poses = {}
@@ -561,32 +609,37 @@ def bake_controls(context, armature, classification):
 
             set_prop_value(armature, key, sample_value)
             posed = snapshot_driver_bones(context, armature, all_driver_bones)
-            changed = {
+            posed_shape_keys = snapshot_shape_keys(armature)
+            changed_bones = {
                 bone_name: snapshot
                 for bone_name, snapshot in posed.items()
                 if bone_name in neutral
                 and max_matrix_diff(neutral[bone_name], snapshot) > 0.000001
             }
+            changed_shapes = changed_shape_keys(neutral_shape_keys_all, posed_shape_keys)
             set_prop_value(armature, key, 0.0)
-            if not changed:
+            if not changed_bones and not changed_shapes:
                 continue
 
-            affected_driver_bones.update(changed)
-            poses[pose_name] = {
+            affected_driver_bones.update(changed_bones)
+            affected_shape_keys.update(changed_shapes)
+            pose_record = {
                 "source_value": sample_value,
-                "driver_bases": changed,
             }
+            if changed_bones:
+                pose_record["driver_bases"] = changed_bones
+            if changed_shapes:
+                pose_record["shape_keys"] = changed_shapes
+            poses[pose_name] = pose_record
 
         if poses:
             ui = control["ui"] if isinstance(control.get("ui"), dict) else {}
             morphs.append(
                 {
-                    "key": key,
                     "scope": control["scope"],
                     "name": control["name"],
                     "ui": ui,
                     "default": ui.get("default", 0.0),
-                    "original_value": control["value"],
                     "poses": poses,
                 }
             )
@@ -599,8 +652,12 @@ def bake_controls(context, armature, classification):
             for bone_name in sorted(affected_driver_bones)
             if bone_name in neutral
         },
+        "neutral_shape_keys": {
+            key: neutral_shape_keys_all[key]
+            for key in sorted(affected_shape_keys)
+            if key in neutral_shape_keys_all
+        },
         "morphs": morphs,
-        "affected_driver_bones": sorted(affected_driver_bones),
     }
 
 
@@ -619,6 +676,23 @@ def delete_transform_drivers(armature, affected_driver_bones):
             continue
         armature.animation_data.drivers.remove(fcurve)
         removed += 1
+    return removed
+
+
+def delete_safe_driver_bone_transform_drivers(armature):
+    safe_driver_bones = set(copy_transform_links_by_driver_bone(armature))
+    return delete_transform_drivers(armature, safe_driver_bones)
+
+
+def delete_shape_key_drivers(armature):
+    removed = 0
+    for mesh in related_meshes(armature):
+        shape_keys = mesh.data.shape_keys
+        if not shape_keys or not shape_keys.animation_data:
+            continue
+        for fcurve in list(shape_keys.animation_data.drivers):
+            shape_keys.animation_data.drivers.remove(fcurve)
+            removed += 1
     return removed
 
 
@@ -673,10 +747,10 @@ def make_cache(context, armature):
     print_debug_property_lists(armature, classification, baked)
     return {
         "schema_version": 2,
-        "kind": "daz_mhx_bone_morph_cache",
+        "kind": "daz_mhx_morph_cache",
         "armature": armature.name,
         "neutral_driver_bases": baked["neutral_driver_bases"],
-        "affected_driver_bones": baked["affected_driver_bones"],
+        "neutral_shape_keys": baked["neutral_shape_keys"],
         "morphs": baked["morphs"],
     }, classification
 
@@ -699,6 +773,16 @@ def load_cache_file(armature):
         return json.load(handle), cache_path
 
 
+def resolve_shape_key_runtime(snapshot):
+    mesh = bpy.data.objects.get(snapshot.get("mesh", ""))
+    if not mesh or mesh.type != "MESH" or not mesh.data.shape_keys:
+        return None
+    key_block = mesh.data.shape_keys.key_blocks.get(snapshot.get("shape_key", ""))
+    if not key_block:
+        return None
+    return key_block
+
+
 def matrix_components(rows):
     loc, rot, scale = matrix_from_plain(rows).decompose()
     return loc, rot, scale
@@ -714,6 +798,10 @@ def delta_components(neutral_snapshot, posed_snapshot):
         "rot": rot,
         "scale": scale,
     }
+
+
+def shape_delta(neutral_snapshot, posed_snapshot):
+    return posed_snapshot["value"] - neutral_snapshot["value"]
 
 
 def runtime_cache_for_armature(armature, force_reload=False):
@@ -741,6 +829,17 @@ def runtime_cache_for_armature(armature, force_reload=False):
         neutral_bones[bone_name] = {
             "pose_bone": pose_bone,
             "matrix": matrix_from_plain(snapshot["matrix_basis"]),
+            "snapshot": snapshot,
+        }
+
+    neutral_shape_keys = {}
+    for key, snapshot in data.get("neutral_shape_keys", {}).items():
+        key_block = resolve_shape_key_runtime(snapshot)
+        if not key_block:
+            continue
+        neutral_shape_keys[key] = {
+            "key_block": key_block,
+            "value": snapshot["value"],
             "snapshot": snapshot,
         }
 
@@ -778,9 +877,19 @@ def runtime_cache_for_armature(armature, force_reload=False):
                     neutral["snapshot"],
                     posed_snapshot,
                 )
+            shape_deltas = {}
+            for key, posed_snapshot in pose.get("shape_keys", {}).items():
+                neutral = neutral_shape_keys.get(key)
+                if not neutral:
+                    continue
+                shape_deltas[key] = shape_delta(
+                    neutral["snapshot"],
+                    posed_snapshot,
+                )
             runtime_morph["poses"][pose_name] = {
                 "source_value": source_value,
                 "bone_deltas": bone_deltas,
+                "shape_deltas": shape_deltas,
             }
         morphs.append(runtime_morph)
         morphs_by_rna[prop_name] = runtime_morph
@@ -790,6 +899,7 @@ def runtime_cache_for_armature(armature, force_reload=False):
         "modified_time": modified_time,
         "data": data,
         "neutral_bones": neutral_bones,
+        "neutral_shape_keys": neutral_shape_keys,
         "morphs": morphs,
         "morphs_by_rna": morphs_by_rna,
     }
@@ -890,6 +1000,8 @@ def sync_rna_controls_from_id_props(armature, runtime):
 def apply_runtime_cache(armature, runtime, force=False):
     changed = force
     active = 0
+    matrices = None
+    shape_values = None
     for morph in runtime["morphs"]:
         value = float(morph["id_block"].get(morph["name"], 0.0))
         if morph["last_value"] is None or abs(value - morph["last_value"]) > 0.000001:
@@ -898,40 +1010,59 @@ def apply_runtime_cache(armature, runtime, force=False):
         if abs(value) <= 0.000001:
             continue
 
-        if active == 0:
-            matrices = {
-                bone_name: item["matrix"].copy()
-                for bone_name, item in runtime["neutral_bones"].items()
-            }
-
         pose_name = "positive" if value > 0.0 else "negative"
         pose = morph["poses"].get(pose_name)
         if not pose:
+            continue
+        if not pose.get("bone_deltas") and not pose.get("shape_deltas"):
             continue
         source_value = pose.get("source_value", 1.0) or 1.0
         factor = abs(value / source_value)
         active += 1
 
-        for bone_name, delta in pose["bone_deltas"].items():
+        if pose.get("bone_deltas") and matrices is None:
+            matrices = {
+                bone_name: item["matrix"].copy()
+                for bone_name, item in runtime["neutral_bones"].items()
+            }
+        if pose.get("shape_deltas") and shape_values is None:
+            shape_values = {
+                key: item["value"]
+                for key, item in runtime["neutral_shape_keys"].items()
+            }
+
+        for bone_name, delta in pose.get("bone_deltas", {}).items():
             if bone_name not in matrices:
                 continue
             matrices[bone_name] = matrices[bone_name] @ weighted_delta_matrix(delta, factor)
+        for key, delta in pose.get("shape_deltas", {}).items():
+            if key not in shape_values:
+                continue
+            shape_values[key] += delta * factor
 
     if not changed:
         return 0, active
 
-    if active == 0:
+    if active == 0 or matrices is None:
         matrices = {
             bone_name: item["matrix"].copy()
             for bone_name, item in runtime["neutral_bones"].items()
         }
+    if active == 0 or shape_values is None:
+        shape_values = {
+            key: item["value"]
+            for key, item in runtime["neutral_shape_keys"].items()
+        }
 
     for bone_name, matrix in matrices.items():
         runtime["neutral_bones"][bone_name]["pose_bone"].matrix_basis = matrix
+    for key, value in shape_values.items():
+        runtime["neutral_shape_keys"][key]["key_block"].value = value
     armature["daz_mhx_v2_status"] = (
-        f"Applied {active} active cached bone morphs to {len(matrices)} driver bones."
+        f"Applied {active} active cached morphs to {len(matrices)} driver bones "
+        f"and {len(shape_values)} shape keys."
     )
-    return len(matrices), active
+    return len(matrices) + len(shape_values), active
 
 
 def load_or_apply_runtime(armature, force_reload=False, force_apply=False):
@@ -948,8 +1079,8 @@ def load_or_apply_runtime(armature, force_reload=False, force_apply=False):
 
 class DAZMHX_OT_v2_write_cache(bpy.types.Operator):
     bl_idname = "daz_mhx.v2_write_cache"
-    bl_label = "Write Bone Morph Cache"
-    bl_description = "Bake bone-only custom props to JSON without deleting drivers or custom properties"
+    bl_label = "Write Morph Cache"
+    bl_description = "Bake custom prop morphs to JSON without deleting drivers or custom properties"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -963,14 +1094,13 @@ class DAZMHX_OT_v2_write_cache(bpy.types.Operator):
         runtime_cache_for_armature(armature, force_reload=True)
 
         armature["daz_mhx_v2_status"] = (
-            f"Wrote {len(cache['morphs'])} cached bone morphs. "
+            f"Wrote {len(cache['morphs'])} cached morphs. "
             "Original drivers/custom props were not deleted."
         )
         self.report(
             {"INFO"},
             (
-                f"Wrote {cache_path} with {len(cache['morphs'])} cached bone morphs; "
-                f"found {len(classification['protected_props'])} shape-key-protected props."
+                f"Wrote {cache_path} with {len(cache['morphs'])} cached morphs."
             ),
         )
         return {"FINISHED"}
@@ -979,7 +1109,7 @@ class DAZMHX_OT_v2_write_cache(bpy.types.Operator):
 class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
     bl_idname = "daz_mhx.v2_delete_originals"
     bl_label = "Delete Converted Drivers/Props"
-    bl_description = "Delete drivers and custom props related to the existing V2 bone-morph cache, then rebuild the cached controls"
+    bl_description = "Delete drivers and custom props related to the existing V2 morph cache, then rebuild the cached controls"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -994,14 +1124,8 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
             return {"CANCELLED"}
 
         classification = build_classification(armature)
-        affected_driver_bones = set(cache.get("affected_driver_bones", []))
-        if not affected_driver_bones:
-            affected_driver_bones = set(cache.get("neutral_driver_bases", {}).keys())
-
-        removed_transform_drivers = delete_transform_drivers(
-            armature,
-            affected_driver_bones,
-        )
+        removed_transform_drivers = delete_safe_driver_bone_transform_drivers(armature)
+        removed_shape_key_drivers = delete_shape_key_drivers(armature)
         removed_prop_drivers, deleted_props, rebuilt_props = delete_and_rebuild_props(
             armature,
             cache,
@@ -1011,6 +1135,7 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
         armature["daz_mhx_v2_cache_path"] = cache_path
         armature["daz_mhx_v2_cache_id"] = armature.name
         armature["daz_mhx_v2_removed_transform_drivers"] = removed_transform_drivers
+        armature["daz_mhx_v2_removed_shape_key_drivers"] = removed_shape_key_drivers
         armature["daz_mhx_v2_removed_prop_drivers"] = removed_prop_drivers
         armature["daz_mhx_v2_deleted_props"] = deleted_props
         armature["daz_mhx_v2_rebuilt_props"] = rebuilt_props
@@ -1025,13 +1150,15 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
         armature["daz_mhx_v2_status"] = (
             f"Deleted/rebuilt {rebuilt_props} cached controls; removed "
             f"{removed_transform_drivers} transform drivers and "
+            f"{removed_shape_key_drivers} shape-key drivers and "
             f"{removed_prop_drivers} custom-property drivers."
         )
         self.report(
             {"INFO"},
             (
                 f"Deleted/rebuilt {rebuilt_props} controls; removed "
-                f"{removed_transform_drivers} transform drivers."
+                f"{removed_transform_drivers} transform drivers and "
+                f"{removed_shape_key_drivers} shape-key drivers."
             ),
         )
         return {"FINISHED"}
@@ -1100,7 +1227,7 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
             runtime = runtime_cache_for_armature(armature)
             if runtime and runtime.get("morphs"):
                 box = layout.box()
-                box.label(text="Converted Bone Morphs")
+                box.label(text="Converted Morphs")
                 for morph in sorted(
                     runtime["morphs"],
                     key=lambda item: (
