@@ -107,6 +107,8 @@ def to_plain_value(value):
         return value
     if hasattr(value, "to_list"):
         return value.to_list()
+    if isinstance(value, dict):
+        return {str(key): to_plain_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [to_plain_value(item) for item in value]
     try:
@@ -127,6 +129,8 @@ def property_ui_data(id_block, name):
 
 
 def update_property_ui(id_block, name, ui):
+    if not isinstance(ui, dict):
+        return
     if not ui:
         return
 
@@ -386,6 +390,9 @@ def build_classification(armature):
 
 
 def debug_prop_list_entry(item):
+    ui = item.get("ui", {})
+    if not isinstance(ui, dict):
+        ui = {}
     return {
         "key": item["key"],
         "scope": item["scope"],
@@ -394,7 +401,7 @@ def debug_prop_list_entry(item):
         "is_numeric_scalar": item.get("is_numeric_scalar", False),
         "reaches_bones": item.get("reaches_bones", False),
         "reaches_shape_keys": item.get("reaches_shape_keys", False),
-        "ui": item.get("ui", {}),
+        "ui": ui,
     }
 
 
@@ -476,6 +483,8 @@ def max_matrix_diff(a, b):
 
 def sample_value_for_control(control, direction):
     ui = control.get("ui", {})
+    if not isinstance(ui, dict):
+        ui = {}
     if direction > 0:
         max_value = ui.get("max", ui.get("soft_max", 1.0))
         try:
@@ -547,13 +556,14 @@ def bake_controls(context, armature, classification):
             }
 
         if poses:
+            ui = control["ui"] if isinstance(control.get("ui"), dict) else {}
             morphs.append(
                 {
                     "key": key,
                     "scope": control["scope"],
                     "name": control["name"],
-                    "ui": control["ui"],
-                    "default": control["ui"].get("default", 0.0),
+                    "ui": ui,
+                    "default": ui.get("default", 0.0),
                     "original_value": control["value"],
                     "poses": poses,
                 }
