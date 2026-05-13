@@ -20,6 +20,7 @@ bl_info = {
 
 OUTPUT_DIR = r"C:\Users\meat\Documents\blender\code\Daz Cleaner"
 DEFAULT_OUTPUT_FILENAME = "mhx_analysis.json"
+DEFAULT_BONE_DRIVER_OUTPUT_FILENAME = "mhx_bone_drivers.json"
 
 POSE_BONE_PATH_RE = re.compile(r'pose\.bones\["([^"]+)"\]\.(.+)')
 CUSTOM_PROPERTY_PATH_RE = re.compile(r'\["([^"]+)"\]')
@@ -626,6 +627,103 @@ def collect_armature_driver_simplification_data(armature):
     }
 
 
+def compact_source_refs(source_refs):
+    refs = []
+    for source_ref in source_refs:
+        props = source_ref["custom_properties"]
+        if props:
+            refs.extend(
+                {
+                    "variable": source_ref["variable_name"],
+                    "type": source_ref["variable_type"],
+                    "property": prop_name,
+                    "data_path": source_ref["data_path"],
+                }
+                for prop_name in props
+            )
+            continue
+
+        if source_ref["bone_target"] or source_ref["data_path"]:
+            refs.append(
+                {
+                    "variable": source_ref["variable_name"],
+                    "type": source_ref["variable_type"],
+                    "bone": source_ref["bone_target"],
+                    "data_path": source_ref["data_path"],
+                    "transform_type": source_ref["transform_type"],
+                    "transform_space": source_ref["transform_space"],
+                }
+            )
+
+    return refs
+
+
+def collect_compact_bone_driver_report(armature):
+    bones = defaultdict(list)
+    channel_counts = Counter()
+    expression_counts = Counter()
+    owner_counts = Counter()
+    driver_count = 0
+
+    for owner_label, id_block in (
+        ("object", armature),
+        ("data", armature.data),
+    ):
+        if not id_block or not id_block.animation_data:
+            continue
+
+        for fcurve in id_block.animation_data.drivers:
+            pose_path = parse_pose_bone_data_path(fcurve.data_path)
+            if not pose_path:
+                continue
+
+            driver = fcurve.driver
+            driver_count += 1
+            channel_counts[pose_path["channel_base"]] += 1
+            expression_counts[driver.expression] += 1
+            owner_counts[owner_label] += 1
+
+            bones[pose_path["bone_name"]].append(
+                {
+                    "owner": owner_label,
+                    "channel": pose_path["channel_base"],
+                    "array_index": fcurve.array_index,
+                    "expression": driver.expression,
+                    "variables": compact_source_refs(collect_driver_source_refs(driver)),
+                }
+            )
+
+    return {
+        "armature": armature.name,
+        "summary": {
+            "bone_driver_count": driver_count,
+            "driven_bone_count": len(bones),
+            "owner_counts": dict(owner_counts),
+            "channel_counts": dict(channel_counts),
+            "top_expressions": [
+                {"expression": expression, "count": count}
+                for expression, count in expression_counts.most_common(25)
+            ],
+        },
+        "bones": [
+            {
+                "name": bone_name,
+                "driver_count": len(drivers),
+                "drivers": sorted(
+                    drivers,
+                    key=lambda item: (
+                        item["owner"],
+                        item["channel"],
+                        item["array_index"],
+                        item["expression"],
+                    ),
+                ),
+            }
+            for bone_name, drivers in sorted(bones.items(), key=lambda item: item[0].lower())
+        ],
+    }
+
+
 def collect_bone_data(armature):
     bones = []
     data_bones = armature.data.bones if armature.data else {}
@@ -799,8 +897,25 @@ def build_report(context):
     }
 
 
+def build_bone_driver_report(context):
+    armatures = selected_armatures(context)
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "blend_file": bpy.data.filepath,
+        "selected_armatures": [
+            collect_compact_bone_driver_report(armature)
+            for armature in armatures
+        ],
+    }
+
+
 def default_output_path():
     return os.path.join(OUTPUT_DIR, DEFAULT_OUTPUT_FILENAME)
+
+
+def default_bone_driver_output_path():
+    return os.path.join(OUTPUT_DIR, DEFAULT_BONE_DRIVER_OUTPUT_FILENAME)
 
 
 class MHX_OT_export_analysis_json(bpy.types.Operator):
@@ -832,6 +947,35 @@ class MHX_OT_export_analysis_json(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MHX_OT_export_bone_drivers_json(bpy.types.Operator):
+    bl_idname = "mhx.export_bone_drivers_json"
+    bl_label = "Export Bone Drivers JSON"
+    bl_description = "Export a compact list of pose-bone drivers grouped by driven bone"
+    bl_options = {"REGISTER"}
+
+    output_path: bpy.props.StringProperty(
+        name="Output Path",
+        subtype="FILE_PATH",
+        default=default_bone_driver_output_path(),
+    )
+
+    def execute(self, context):
+        if not selected_armatures(context):
+            self.report({"WARNING"}, "Select at least one armature.")
+            return {"CANCELLED"}
+
+        path = bpy.path.abspath(self.output_path)
+        output_dir = os.path.dirname(path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(build_bone_driver_report(context), handle, indent=2, sort_keys=True)
+
+        self.report({"INFO"}, f"Wrote compact bone driver JSON: {path}")
+        return {"FINISHED"}
+
+
 class MHX_PT_rig_analyzer(bpy.types.Panel):
     bl_label = "MHX Rig Analyzer"
     bl_idname = "MHX_PT_rig_analyzer"
@@ -845,10 +989,12 @@ class MHX_PT_rig_analyzer(bpy.types.Panel):
 
         layout.label(text=f"Selected armatures: {selected_count}")
         layout.operator("mhx.export_analysis_json", text="Export Analysis JSON")
+        layout.operator("mhx.export_bone_drivers_json", text="Export Bone Drivers JSON")
 
 
 classes = (
     MHX_OT_export_analysis_json,
+    MHX_OT_export_bone_drivers_json,
     MHX_PT_rig_analyzer,
 )
 
