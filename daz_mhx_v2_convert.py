@@ -407,34 +407,9 @@ def build_classification(armature):
     }
 
 
-def debug_prop_list_entry(item):
-    ui = item.get("ui", {})
-    if not isinstance(ui, dict):
-        ui = {}
-    return {
-        "key": item["key"],
-        "scope": item["scope"],
-        "name": item["name"],
-        "is_driven": item.get("is_driven", False),
-        "is_numeric_scalar": item.get("is_numeric_scalar", False),
-        "reaches_bones": item.get("reaches_bones", False),
-        "reaches_shape_keys": item.get("reaches_shape_keys", False),
-        "ui": ui,
-    }
-
-
 def sorted_debug_prop_list(items):
-    return [
-        debug_prop_list_entry(item)
-        for item in sorted(
-            items,
-            key=lambda item: (
-                item.get("name", "").lower(),
-                item.get("scope", ""),
-                item.get("key", ""),
-            ),
-        )
-    ]
+    names = {item.get("name", "") for item in items if item.get("name")}
+    return sorted(names, key=str.lower)
 
 
 def debug_property_lists(classification):
