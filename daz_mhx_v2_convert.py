@@ -52,12 +52,6 @@ def runtime_key_for_armature(armature, path):
     return (armature.as_pointer(), path)
 
 
-def scene_frame_key(scene):
-    if not scene:
-        return None
-    return (scene.frame_current, round(scene.frame_subframe, 6))
-
-
 def id_prop_path(name):
     escaped = name.replace("\\", "\\\\").replace('"', '\\"')
     return f'["{escaped}"]'
@@ -790,7 +784,6 @@ def runtime_cache_for_armature(armature, force_reload=False):
         "data": data,
         "neutral_bones": neutral_bones,
         "morphs": morphs,
-        "last_frame_key": None,
     }
     _RUNTIME_CACHES[cache_key] = runtime
     return runtime
@@ -804,14 +797,13 @@ def weighted_delta_matrix(delta, factor):
     return Matrix.LocRotScale(loc, rot, scale)
 
 
-def apply_runtime_cache(armature, runtime, scene=None, force=False):
+def apply_runtime_cache(armature, runtime, force=False):
     matrices = {
         bone_name: item["matrix"].copy()
         for bone_name, item in runtime["neutral_bones"].items()
     }
 
-    current_frame_key = scene_frame_key(scene)
-    changed = force or current_frame_key != runtime.get("last_frame_key")
+    changed = force
     active = 0
     for morph in runtime["morphs"]:
         value = float(morph["id_block"].get(morph["name"], 0.0))
@@ -839,14 +831,13 @@ def apply_runtime_cache(armature, runtime, scene=None, force=False):
 
     for bone_name, matrix in matrices.items():
         runtime["neutral_bones"][bone_name]["pose_bone"].matrix_basis = matrix
-    runtime["last_frame_key"] = current_frame_key
     armature["daz_mhx_v2_status"] = (
         f"Applied {active} active cached bone morphs to {len(matrices)} driver bones."
     )
     return len(matrices), active
 
 
-def load_or_apply_runtime(armature, scene=None, force_reload=False, force_apply=False):
+def load_or_apply_runtime(armature, force_reload=False, force_apply=False):
     runtime = runtime_cache_for_armature(armature, force_reload=force_reload)
     if not runtime:
         armature["daz_mhx_v2_status"] = "No V2 cache found for this armature."
@@ -854,7 +845,6 @@ def load_or_apply_runtime(armature, scene=None, force_reload=False, force_apply=
     return apply_runtime_cache(
         armature,
         runtime,
-        scene=scene,
         force=force_apply or force_reload,
     )
 
@@ -872,7 +862,7 @@ def daz_mhx_v2_depsgraph_handler(scene, depsgraph):
                 continue
             if not obj.get("daz_mhx_v2_cache_path"):
                 continue
-            load_or_apply_runtime(obj, scene=scene)
+            load_or_apply_runtime(obj)
     finally:
         _APPLYING = False
 
@@ -915,7 +905,6 @@ class DAZMHX_OT_v2_aggressive_convert(bpy.types.Operator):
         runtime_cache_for_armature(armature, force_reload=True)
         load_or_apply_runtime(
             armature,
-            scene=context.scene,
             force_reload=True,
             force_apply=True,
         )
@@ -953,11 +942,27 @@ class DAZMHX_OT_v2_load_runtime(bpy.types.Operator):
         )
         applied, active = load_or_apply_runtime(
             armature,
-            scene=context.scene,
             force_reload=True,
             force_apply=True,
         )
         self.report({"INFO"}, f"Loaded V2 cache; applied {active} active morphs to {applied} bones.")
+        return {"FINISHED"}
+
+
+class DAZMHX_OT_v2_apply_current(bpy.types.Operator):
+    bl_idname = "daz_mhx.v2_apply_current"
+    bl_label = "Apply Current Morphs"
+    bl_description = "Force-apply the current cached morph values once"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        armature = selected_armature(context)
+        if not armature:
+            self.report({"WARNING"}, "Select an armature.")
+            return {"CANCELLED"}
+
+        applied, active = load_or_apply_runtime(armature, force_apply=True)
+        self.report({"INFO"}, f"Applied {active} active morphs to {applied} bones.")
         return {"FINISHED"}
 
 
@@ -974,6 +979,7 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
 
         layout.operator("daz_mhx.v2_aggressive_convert")
         layout.operator("daz_mhx.v2_load_runtime")
+        layout.operator("daz_mhx.v2_apply_current")
         if armature:
             layout.label(text=armature.get("daz_mhx_v2_status", "No V2 cache loaded."))
             layout.label(text=f"Cache: {os.path.basename(cache_path_for_armature(armature))}")
@@ -1005,6 +1011,7 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
 classes = (
     DAZMHX_OT_v2_aggressive_convert,
     DAZMHX_OT_v2_load_runtime,
+    DAZMHX_OT_v2_apply_current,
     DAZMHX_PT_v2_converter,
 )
 
