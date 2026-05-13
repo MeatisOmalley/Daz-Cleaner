@@ -25,11 +25,16 @@ DEFAULT_OUTPUT_FILENAME = "daz_mhx_test_eCTRLSerious.json"
 POSE_BONE_PATH_RE = re.compile(r'pose\.bones\["([^"]+)"\]\.(.+)')
 CUSTOM_PROPERTY_PATH_RE = re.compile(r'\["([^"]+)"\]')
 
-_CACHE = {}
+_JSON_CACHE = {}
+_RUNTIME_CACHE = {}
 
 
 def output_path():
     return os.path.join(OUTPUT_DIR, DEFAULT_OUTPUT_FILENAME)
+
+
+def cache_id_for_armature(armature):
+    return armature.name if armature else "UNKNOWN_ARMATURE"
 
 
 def selected_armature(context):
@@ -476,6 +481,7 @@ def bake_prop_to_json(context, armature, prop_name, prop_value=1.0):
         "schema_version": 1,
         "kind": "daz_mhx_test_driver_pose_cache",
         "armature": armature.name,
+        "cache_id": cache_id_for_armature(armature),
         "source_property": prop_name,
         "source_value": prop_value,
         "direct_driver_record_count": len(direct_records),
@@ -530,46 +536,108 @@ def lerp_matrix_basis(neutral_rows, posed_rows, weight):
     return Matrix.LocRotScale(loc, rot, scale)
 
 
-def cached_pose_data():
+def matrix_components_from_snapshot(snapshot):
+    loc, rot, scale = matrix_from_plain(snapshot["matrix_basis"]).decompose()
+    return loc, rot, scale
+
+
+def cached_pose_data(force_reload=False):
     path = output_path()
     if not os.path.exists(path):
         return None
 
     modified_time = os.path.getmtime(path)
-    cache_record = _CACHE.get(path)
-    if cache_record and cache_record["modified_time"] == modified_time:
+    cache_record = _JSON_CACHE.get(path)
+    if (
+        cache_record
+        and not force_reload
+        and cache_record["modified_time"] == modified_time
+    ):
         return cache_record["data"]
 
     with open(path, "r", encoding="utf-8") as handle:
         data = json.load(handle)
 
-    _CACHE[path] = {
+    _JSON_CACHE[path] = {
         "modified_time": modified_time,
         "data": data,
     }
     return data
 
 
-def apply_cached_pose_from_file(armature, weight):
-    cache = cached_pose_data()
+def runtime_pose_cache(armature, force_reload=False):
+    cache_id = cache_id_for_armature(armature)
+    path = output_path()
+    runtime_key = (cache_id, path)
+    if runtime_key in _RUNTIME_CACHE and not force_reload:
+        return _RUNTIME_CACHE[runtime_key]
+
+    cache = cached_pose_data(force_reload=force_reload)
     if not cache:
-        armature["daz_mhx_test_status"] = "No cache file found. Run Test Cache eCTRLSerious first."
-        return
+        return None
 
     pose = cache.get("poses", {}).get("positive", {})
     if not pose.get("driver_bases") or not pose.get("neutral_driver_bases"):
-        armature["daz_mhx_test_status"] = "Cache is old or incomplete. Re-run Test Cache eCTRLSerious."
+        return {
+            "cache_id": cache_id,
+            "cache": cache,
+            "items": [],
+            "error": "Cache is old or incomplete. Re-run Test Cache eCTRLSerious.",
+        }
+
+    items = []
+    for bone_name, snapshot in pose.get("driver_bases", {}).items():
+        pose_bone = armature.pose.bones.get(bone_name)
+        neutral = pose.get("neutral_driver_bases", {}).get(bone_name)
+        if not pose_bone or not neutral:
+            continue
+
+        neutral_loc, neutral_rot, neutral_scale = matrix_components_from_snapshot(neutral)
+        posed_loc, posed_rot, posed_scale = matrix_components_from_snapshot(snapshot)
+        items.append(
+            {
+                "bone_name": bone_name,
+                "pose_bone": pose_bone,
+                "neutral_loc": neutral_loc,
+                "neutral_rot": neutral_rot,
+                "neutral_scale": neutral_scale,
+                "posed_loc": posed_loc,
+                "posed_rot": posed_rot,
+                "posed_scale": posed_scale,
+            }
+        )
+
+    runtime = {
+        "cache_id": cache_id,
+        "cache": cache,
+        "items": items,
+        "error": "",
+    }
+    _RUNTIME_CACHE[runtime_key] = runtime
+    return runtime
+
+
+def matrix_from_runtime_item(item, weight):
+    loc = item["neutral_loc"].lerp(item["posed_loc"], weight)
+    rot = item["neutral_rot"].slerp(item["posed_rot"], weight)
+    scale = item["neutral_scale"].lerp(item["posed_scale"], weight)
+    return Matrix.LocRotScale(loc, rot, scale)
+
+
+def apply_cached_pose_from_file(armature, weight):
+    runtime = runtime_pose_cache(armature)
+    if not runtime:
+        armature["daz_mhx_test_status"] = "No cache file found. Run Test Cache eCTRLSerious first."
+        return
+    if runtime.get("error"):
+        armature["daz_mhx_test_status"] = runtime["error"]
         return
 
-    applied_count = apply_bone_snapshots(
-        armature,
-        pose.get("neutral_driver_bases", {}),
-        pose.get("driver_bases", {}),
-        weight,
-    )
+    applied_count = apply_runtime_pose_cache(runtime, weight)
 
     armature["daz_mhx_test_status"] = (
-        f"Applied cached serious={weight:.3f} to {applied_count} driver bones."
+        f"Applied cached serious={weight:.3f} to {applied_count} driver bones "
+        f"from cache {runtime['cache_id']}."
     )
 
 
@@ -603,6 +671,14 @@ def apply_bone_snapshots(armature, neutral_bones, baked_bones, weight):
             snapshot["matrix_basis"],
             weight,
         )
+        applied_count += 1
+    return applied_count
+
+
+def apply_runtime_pose_cache(runtime, weight):
+    applied_count = 0
+    for item in runtime["items"]:
+        item["pose_bone"].matrix_basis = matrix_from_runtime_item(item, weight)
         applied_count += 1
     return applied_count
 
@@ -672,8 +748,11 @@ class DAZMHX_OT_test_convert_prop(bpy.types.Operator):
             armature,
             cache["driver_records"],
         )
-        _CACHE.clear()
+        _JSON_CACHE.clear()
+        _RUNTIME_CACHE.pop((cache_id_for_armature(armature), output_path()), None)
+        runtime_pose_cache(armature, force_reload=True)
         armature["daz_mhx_test_cache_path"] = output_path()
+        armature["daz_mhx_test_cache_id"] = cache_id_for_armature(armature)
         armature["daz_mhx_test_source_property"] = self.prop_name
         armature["daz_mhx_test_driver_record_count"] = cache["driver_record_count"]
         armature["daz_mhx_test_removed_driver_count"] = removed
