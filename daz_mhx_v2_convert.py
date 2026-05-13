@@ -646,42 +646,42 @@ def make_cache(context, armature):
         "schema_version": 2,
         "kind": "daz_mhx_bone_morph_cache",
         "armature": armature.name,
-        "cache_id": armature.name,
         "neutral_driver_bases": baked["neutral_driver_bases"],
         "affected_driver_bones": baked["affected_driver_bones"],
         "morphs": baked["morphs"],
-        "classification_summary": {
-            "controls": len(classification["controls"]),
-            "baked_morphs": len(baked["morphs"]),
-            "internal_delete_props": len(classification["internal_delete_props"]),
-            "protected_shape_key_props": len(classification["protected_props"]),
-            "bone_morph_props": len(debug_lists["bone_morphs"]),
-            "mixed_morph_props": len(debug_lists["mixed_morphs"]),
-            "shapekey_morph_props": len(debug_lists["shapekey_morphs"]),
-            "shape_key_drivers": len(classification["shape_drivers"]),
-            "bone_transform_drivers": len(classification["transform_drivers"]),
+        "debug": {
+            "summary": {
+                "controls": len(classification["controls"]),
+                "baked_morphs": len(baked["morphs"]),
+                "internal_delete_props": len(classification["internal_delete_props"]),
+                "protected_shape_key_props": len(classification["protected_props"]),
+                "bone_morph_props": len(debug_lists["bone_morphs"]),
+                "mixed_morph_props": len(debug_lists["mixed_morphs"]),
+                "shapekey_morph_props": len(debug_lists["shapekey_morphs"]),
+                "shape_key_drivers": len(classification["shape_drivers"]),
+                "bone_transform_drivers": len(classification["transform_drivers"]),
+            },
+            "property_lists": debug_lists,
         },
-        "debug_property_lists": debug_lists,
-        "protected_shape_key_props": [
-            {
-                "key": item["key"],
-                "scope": item["scope"],
-                "name": item["name"],
-                "reaches_bones": item["reaches_bones"],
-            }
-            for item in classification["protected_props"]
-        ],
-        "internal_delete_props": [
-            {
-                "key": item["key"],
-                "scope": item["scope"],
-                "name": item["name"],
-                "is_driven": item["is_driven"],
-            }
-            for item in classification["internal_delete_props"]
-        ],
-        "shape_drivers": classification["shape_drivers"],
     }, classification
+
+
+def write_cache_file(armature, cache):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    cache_path = cache_path_for_armature(armature)
+    with open(cache_path, "w", encoding="utf-8") as handle:
+        json.dump(cache, handle, indent=2, sort_keys=True)
+    armature["daz_mhx_v2_cache_path"] = cache_path
+    armature["daz_mhx_v2_cache_id"] = armature.name
+    return cache_path
+
+
+def load_cache_file(armature):
+    cache_path = armature.get("daz_mhx_v2_cache_path", cache_path_for_armature(armature))
+    if not os.path.exists(cache_path):
+        return None, cache_path
+    with open(cache_path, "r", encoding="utf-8") as handle:
+        return json.load(handle), cache_path
 
 
 def matrix_components(rows):
@@ -931,10 +931,10 @@ def load_or_apply_runtime(armature, force_reload=False, force_apply=False):
     )
 
 
-class DAZMHX_OT_v2_aggressive_convert(bpy.types.Operator):
-    bl_idname = "daz_mhx.v2_aggressive_convert"
-    bl_label = "Aggressive Convert Bone Morphs"
-    bl_description = "Bake bone-only custom props, delete their drivers/properties, rebuild controls, and load runtime cache"
+class DAZMHX_OT_v2_write_cache(bpy.types.Operator):
+    bl_idname = "daz_mhx.v2_write_cache"
+    bl_label = "Write Bone Morph Cache"
+    bl_description = "Bake bone-only custom props to JSON without deleting drivers or custom properties"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -943,15 +943,49 @@ class DAZMHX_OT_v2_aggressive_convert(bpy.types.Operator):
             self.report({"WARNING"}, "Select an armature.")
             return {"CANCELLED"}
 
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
         cache, classification = make_cache(context, armature)
-        cache_path = cache_path_for_armature(armature)
-        with open(cache_path, "w", encoding="utf-8") as handle:
-            json.dump(cache, handle, indent=2, sort_keys=True)
+        cache_path = write_cache_file(armature, cache)
+        runtime_cache_for_armature(armature, force_reload=True)
+
+        armature["daz_mhx_v2_status"] = (
+            f"Wrote {len(cache['morphs'])} cached bone morphs. "
+            "Original drivers/custom props were not deleted."
+        )
+        self.report(
+            {"INFO"},
+            (
+                f"Wrote {cache_path} with {len(cache['morphs'])} cached bone morphs; "
+                f"found {len(classification['protected_props'])} shape-key-protected props."
+            ),
+        )
+        return {"FINISHED"}
+
+
+class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
+    bl_idname = "daz_mhx.v2_delete_originals"
+    bl_label = "Delete Converted Drivers/Props"
+    bl_description = "Delete drivers and custom props related to the existing V2 bone-morph cache, then rebuild the cached controls"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        armature = selected_armature(context)
+        if not armature:
+            self.report({"WARNING"}, "Select an armature.")
+            return {"CANCELLED"}
+
+        cache, cache_path = load_cache_file(armature)
+        if not cache:
+            self.report({"WARNING"}, f"No V2 cache found at {cache_path}. Write the cache first.")
+            return {"CANCELLED"}
+
+        classification = build_classification(armature)
+        affected_driver_bones = set(cache.get("affected_driver_bones", []))
+        if not affected_driver_bones:
+            affected_driver_bones = set(cache.get("neutral_driver_bases", {}).keys())
 
         removed_transform_drivers = delete_transform_drivers(
             armature,
-            set(cache["affected_driver_bones"]),
+            affected_driver_bones,
         )
         removed_prop_drivers, deleted_props, rebuilt_props = delete_and_rebuild_props(
             armature,
@@ -974,15 +1008,15 @@ class DAZMHX_OT_v2_aggressive_convert(bpy.types.Operator):
         )
 
         armature["daz_mhx_v2_status"] = (
-            f"Converted {rebuilt_props} bone-only controls; removed "
+            f"Deleted/rebuilt {rebuilt_props} cached controls; removed "
             f"{removed_transform_drivers} transform drivers and "
             f"{removed_prop_drivers} custom-property drivers."
         )
         self.report(
             {"INFO"},
             (
-                f"Wrote {cache_path}; converted {rebuilt_props} controls; "
-                f"removed {removed_transform_drivers} transform drivers."
+                f"Deleted/rebuilt {rebuilt_props} controls; removed "
+                f"{removed_transform_drivers} transform drivers."
             ),
         )
         return {"FINISHED"}
@@ -1041,7 +1075,8 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
         layout = self.layout
         armature = selected_armature(context)
 
-        layout.operator("daz_mhx.v2_aggressive_convert")
+        layout.operator("daz_mhx.v2_write_cache")
+        layout.operator("daz_mhx.v2_delete_originals")
         layout.operator("daz_mhx.v2_load_runtime")
         layout.operator("daz_mhx.v2_apply_current")
         if armature:
@@ -1073,7 +1108,8 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
 
 
 classes = (
-    DAZMHX_OT_v2_aggressive_convert,
+    DAZMHX_OT_v2_write_cache,
+    DAZMHX_OT_v2_delete_originals,
     DAZMHX_OT_v2_load_runtime,
     DAZMHX_OT_v2_apply_current,
     DAZMHX_PT_v2_converter,
