@@ -385,6 +385,57 @@ def build_classification(armature):
     }
 
 
+def debug_prop_list_entry(item):
+    return {
+        "key": item["key"],
+        "scope": item["scope"],
+        "name": item["name"],
+        "is_driven": item.get("is_driven", False),
+        "is_numeric_scalar": item.get("is_numeric_scalar", False),
+        "reaches_bones": item.get("reaches_bones", False),
+        "reaches_shape_keys": item.get("reaches_shape_keys", False),
+        "ui": item.get("ui", {}),
+    }
+
+
+def sorted_debug_prop_list(items):
+    return [
+        debug_prop_list_entry(item)
+        for item in sorted(
+            items,
+            key=lambda item: (
+                item.get("name", "").lower(),
+                item.get("scope", ""),
+                item.get("key", ""),
+            ),
+        )
+    ]
+
+
+def debug_property_lists(classification):
+    bone_only = [
+        item
+        for item in classification["controls"] + classification["internal_delete_props"]
+        if item.get("reaches_bones") and not item.get("reaches_shape_keys")
+    ]
+    mixed = [
+        item
+        for item in classification["protected_props"]
+        if item.get("reaches_bones") and item.get("reaches_shape_keys")
+    ]
+    shape_key_only = [
+        item
+        for item in classification["protected_props"]
+        if item.get("reaches_shape_keys") and not item.get("reaches_bones")
+    ]
+
+    return {
+        "bone_morphs": sorted_debug_prop_list(bone_only),
+        "mixed_morphs": sorted_debug_prop_list(mixed),
+        "shapekey_morphs": sorted_debug_prop_list(shape_key_only),
+    }
+
+
 def transform_snapshot(pose_bone):
     return {
         "matrix_basis": [list(row) for row in pose_bone.matrix_basis],
@@ -587,6 +638,7 @@ def delete_and_rebuild_props(armature, cache, classification):
 def make_cache(context, armature):
     classification = build_classification(armature)
     baked = bake_controls(context, armature, classification)
+    debug_lists = debug_property_lists(classification)
     return {
         "schema_version": 2,
         "kind": "daz_mhx_bone_morph_cache",
@@ -600,9 +652,13 @@ def make_cache(context, armature):
             "baked_morphs": len(baked["morphs"]),
             "internal_delete_props": len(classification["internal_delete_props"]),
             "protected_shape_key_props": len(classification["protected_props"]),
+            "bone_morph_props": len(debug_lists["bone_morphs"]),
+            "mixed_morph_props": len(debug_lists["mixed_morphs"]),
+            "shapekey_morph_props": len(debug_lists["shapekey_morphs"]),
             "shape_key_drivers": len(classification["shape_drivers"]),
             "bone_transform_drivers": len(classification["transform_drivers"]),
         },
+        "debug_property_lists": debug_lists,
         "protected_shape_key_props": [
             {
                 "key": item["key"],
