@@ -49,6 +49,13 @@ def cache_path_for_armature(armature):
     )
 
 
+def bone_driver_cleanup_path_for_armature(armature):
+    return os.path.join(
+        OUTPUT_DIR,
+        f"daz_mhx_bone_driver_cleanup_{safe_filename(armature.name)}.json",
+    )
+
+
 def runtime_key_for_armature(armature, path):
     return (armature.as_pointer(), path)
 
@@ -702,6 +709,120 @@ def bake_controls(context, armature, classification):
     }
 
 
+def cached_driver_bones(cache):
+    bones = set((cache or {}).get("neutral_driver_bases", {}))
+    for morph in (cache or {}).get("morphs", []):
+        for pose in morph.get("poses", {}).values():
+            bones.update(pose.get("driver_bases", {}))
+    return bones
+
+
+def compact_driver_audit_entry(armature, fcurve, pose_path, reason=None):
+    entry = {
+        "bone": pose_path["bone_name"],
+        "channel": pose_path["channel_base"],
+        "array_index": fcurve.array_index,
+    }
+    if fcurve.driver:
+        expression = fcurve.driver.expression
+        if expression:
+            entry["expression"] = expression
+        source_props = sorted(source_prop_refs_from_driver(armature, fcurve.driver))
+        if source_props:
+            entry["source_props"] = source_props
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
+def cleanup_cached_bone_transform_drivers(armature, cache):
+    cached_bones = cached_driver_bones(cache)
+    audit = {
+        "armature": armature.name,
+        "cached_driver_bone_count": len(cached_bones),
+        "removed": [],
+        "preserved": [],
+        "ignored": [],
+    }
+
+    if not armature.animation_data:
+        return audit
+
+    for fcurve in list(armature.animation_data.drivers):
+        pose_path = parse_pose_bone_data_path(fcurve.data_path)
+        if not pose_path:
+            continue
+
+        if pose_path["channel_base"] not in SAFE_CHANNELS:
+            audit["ignored"].append(
+                compact_driver_audit_entry(
+                    armature,
+                    fcurve,
+                    pose_path,
+                    "not_transform_channel",
+                )
+            )
+            continue
+
+        if not pose_path["is_driver_bone"]:
+            audit["ignored"].append(
+                compact_driver_audit_entry(
+                    armature,
+                    fcurve,
+                    pose_path,
+                    "not_driver_bone",
+                )
+            )
+            continue
+
+        if pose_path["bone_name"] not in cached_bones:
+            audit["preserved"].append(
+                compact_driver_audit_entry(
+                    armature,
+                    fcurve,
+                    pose_path,
+                    "not_in_cache",
+                )
+            )
+            continue
+
+        audit["removed"].append(compact_driver_audit_entry(armature, fcurve, pose_path))
+        armature.animation_data.drivers.remove(fcurve)
+
+    return audit
+
+
+def write_bone_driver_cleanup_audit(armature, audit):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = bone_driver_cleanup_path_for_armature(armature)
+    summary = {
+        "removed_driver_count": len(audit["removed"]),
+        "preserved_driver_count": len(audit["preserved"]),
+        "ignored_driver_count": len(audit["ignored"]),
+        "cached_driver_bone_count": audit["cached_driver_bone_count"],
+    }
+    payload = {
+        "schema_version": 1,
+        "armature": audit["armature"],
+        "summary": summary,
+        "removed": sorted(
+            audit["removed"],
+            key=lambda item: (item["bone"], item["channel"], item["array_index"]),
+        ),
+        "preserved": sorted(
+            audit["preserved"],
+            key=lambda item: (item["bone"], item["channel"], item["array_index"]),
+        ),
+        "ignored": sorted(
+            audit["ignored"],
+            key=lambda item: (item["reason"], item["bone"], item["channel"], item["array_index"]),
+        ),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    return path, summary
+
+
 def delete_transform_drivers(armature, affected_driver_bones):
     if not armature.animation_data:
         return 0
@@ -1147,6 +1268,53 @@ class DAZMHX_OT_v2_write_cache(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class DAZMHX_OT_v2_delete_cached_bone_drivers(bpy.types.Operator):
+    bl_idname = "daz_mhx.v2_delete_cached_bone_drivers"
+    bl_label = "Delete Cached Bone Drivers"
+    bl_description = "Delete only drv-bone transform drivers covered by the existing V2 morph cache and write a sparse audit JSON"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        armature = selected_armature(context)
+        if not armature:
+            self.report({"WARNING"}, "Select an armature.")
+            return {"CANCELLED"}
+
+        cache, cache_path = load_cache_file(armature)
+        if not cache:
+            self.report({"WARNING"}, f"No V2 cache found at {cache_path}. Write the cache first.")
+            return {"CANCELLED"}
+
+        audit = cleanup_cached_bone_transform_drivers(armature, cache)
+        audit_path, summary = write_bone_driver_cleanup_audit(armature, audit)
+        armature["daz_mhx_v2_cache_path"] = cache_path
+        armature["daz_mhx_v2_bone_driver_cleanup_path"] = audit_path
+        armature["daz_mhx_v2_removed_transform_drivers"] = summary["removed_driver_count"]
+        armature["daz_mhx_v2_preserved_transform_drivers"] = summary["preserved_driver_count"]
+        armature["daz_mhx_v2_ignored_transform_drivers"] = summary["ignored_driver_count"]
+
+        runtime_cache_for_armature(armature, force_reload=True)
+        load_or_apply_runtime(
+            armature,
+            force_reload=True,
+            force_apply=True,
+        )
+
+        armature["daz_mhx_v2_status"] = (
+            f"Removed {summary['removed_driver_count']} cached bone drivers; "
+            f"preserved {summary['preserved_driver_count']}, ignored {summary['ignored_driver_count']}. "
+            f"Audit: {os.path.basename(audit_path)}"
+        )
+        self.report(
+            {"INFO"},
+            (
+                f"Removed {summary['removed_driver_count']} cached bone drivers. "
+                f"Wrote {audit_path}."
+            ),
+        )
+        return {"FINISHED"}
+
+
 class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
     bl_idname = "daz_mhx.v2_delete_originals"
     bl_label = "Delete Converted Drivers/Props"
@@ -1165,7 +1333,9 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
             return {"CANCELLED"}
 
         classification = build_classification(armature)
-        removed_transform_drivers = delete_safe_driver_bone_transform_drivers(armature)
+        audit = cleanup_cached_bone_transform_drivers(armature, cache)
+        audit_path, audit_summary = write_bone_driver_cleanup_audit(armature, audit)
+        removed_transform_drivers = audit_summary["removed_driver_count"]
         removed_shape_key_drivers = delete_shape_key_drivers(armature)
         removed_prop_drivers, deleted_props, rebuilt_props = delete_and_rebuild_props(
             armature,
@@ -1176,6 +1346,9 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
         armature["daz_mhx_v2_cache_path"] = cache_path
         armature["daz_mhx_v2_cache_id"] = armature.name
         armature["daz_mhx_v2_removed_transform_drivers"] = removed_transform_drivers
+        armature["daz_mhx_v2_preserved_transform_drivers"] = audit_summary["preserved_driver_count"]
+        armature["daz_mhx_v2_ignored_transform_drivers"] = audit_summary["ignored_driver_count"]
+        armature["daz_mhx_v2_bone_driver_cleanup_path"] = audit_path
         armature["daz_mhx_v2_removed_shape_key_drivers"] = removed_shape_key_drivers
         armature["daz_mhx_v2_removed_prop_drivers"] = removed_prop_drivers
         armature["daz_mhx_v2_deleted_props"] = deleted_props
@@ -1192,7 +1365,8 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
             f"Deleted/rebuilt {rebuilt_props} cached controls; removed "
             f"{removed_transform_drivers} transform drivers and "
             f"{removed_shape_key_drivers} shape-key drivers and "
-            f"{removed_prop_drivers} custom-property drivers."
+            f"{removed_prop_drivers} custom-property drivers. "
+            f"Bone audit: {os.path.basename(audit_path)}"
         )
         self.report(
             {"INFO"},
@@ -1259,6 +1433,7 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
         armature = selected_armature(context)
 
         layout.operator("daz_mhx.v2_write_cache")
+        layout.operator("daz_mhx.v2_delete_cached_bone_drivers")
         layout.operator("daz_mhx.v2_delete_originals")
         layout.operator("daz_mhx.v2_load_runtime")
         layout.operator("daz_mhx.v2_apply_current")
@@ -1292,6 +1467,7 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
 
 classes = (
     DAZMHX_OT_v2_write_cache,
+    DAZMHX_OT_v2_delete_cached_bone_drivers,
     DAZMHX_OT_v2_delete_originals,
     DAZMHX_OT_v2_load_runtime,
     DAZMHX_OT_v2_apply_current,
