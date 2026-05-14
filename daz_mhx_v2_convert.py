@@ -261,18 +261,27 @@ def source_prop_refs_from_driver(armature, driver):
 
 
 def driver_has_bone_source(driver):
+    return bool(driver_bone_sources(driver))
+
+
+def driver_bone_sources(driver):
+    bones = set()
     for variable in driver.variables:
         for target in variable.targets:
             data_path = getattr(target, "data_path", "") or ""
             if custom_properties_from_path(data_path):
                 continue
-            if getattr(target, "bone_target", ""):
-                return True
+            bone_target = getattr(target, "bone_target", "")
+            if bone_target:
+                bones.add(bone_target)
+                continue
+            parsed = parse_pose_bone_data_path(data_path)
+            if parsed:
+                bones.add(parsed["bone_name"])
+                continue
             if getattr(target, "transform_type", ""):
-                return True
-            if data_path.startswith("pose.bones[") or ".pose.bones[" in data_path:
-                return True
-    return False
+                bones.add("")
+    return {bone for bone in bones if bone}
 
 
 def is_constant_zero_expression(expression):
@@ -335,6 +344,7 @@ def build_prop_driver_trace_index(armature):
             index[output_prop] = {
                 "source_props": source_prop_refs_from_driver(armature, fcurve.driver),
                 "has_bone_source": driver_has_bone_source(fcurve.driver),
+                "bone_sources": driver_bone_sources(fcurve.driver),
             }
     return index
 
@@ -342,6 +352,7 @@ def build_prop_driver_trace_index(armature):
 def trace_prop_dependencies(seed_props, trace_index, max_depth=16):
     visited = set()
     roots = set()
+    bone_sources = set()
     has_bone_source = False
     queue = deque((prop, 0) for prop in seed_props)
 
@@ -357,6 +368,7 @@ def trace_prop_dependencies(seed_props, trace_index, max_depth=16):
             continue
 
         has_bone_source = has_bone_source or record.get("has_bone_source", False)
+        bone_sources.update(record.get("bone_sources", set()))
         source_props = record.get("source_props", set())
         if not source_props:
             roots.add(split_prop_key(key)[1])
@@ -369,6 +381,7 @@ def trace_prop_dependencies(seed_props, trace_index, max_depth=16):
         "props": visited,
         "roots": roots,
         "has_bone_source": has_bone_source,
+        "bone_sources": bone_sources,
         "classification": trace_classification_for_roots(roots, has_bone_source),
     }
 
@@ -441,7 +454,25 @@ def related_meshes(armature):
             if modifier.type == "ARMATURE" and getattr(modifier, "object", None) == armature:
                 meshes.append(obj)
                 break
+        else:
+            if shape_key_drivers_reference_armature(obj, armature):
+                meshes.append(obj)
     return meshes
+
+
+def shape_key_drivers_reference_armature(mesh, armature):
+    shape_keys = getattr(mesh.data, "shape_keys", None)
+    if not shape_keys or not shape_keys.animation_data:
+        return False
+
+    for fcurve in shape_keys.animation_data.drivers:
+        if not fcurve.driver:
+            continue
+        for variable in fcurve.driver.variables:
+            for target in variable.targets:
+                if getattr(target, "id", None) == armature:
+                    return True
+    return False
 
 
 def shape_key_source_props(armature):
@@ -531,7 +562,8 @@ def copy_transform_links_by_driver_bone(armature):
     return links
 
 
-def driver_bones_with_transform_drivers(armature):
+def driver_bones_with_transform_drivers(armature, excluded_bones=None):
+    excluded_bones = excluded_bones or set()
     bones = set()
     if not armature.animation_data:
         return bones
@@ -540,6 +572,8 @@ def driver_bones_with_transform_drivers(armature):
     for fcurve in armature.animation_data.drivers:
         pose_path = parse_pose_bone_data_path(fcurve.data_path)
         if not pose_path:
+            continue
+        if pose_path["bone_name"] in excluded_bones:
             continue
         decision = transform_driver_cache_decision(armature, fcurve, pose_path, trace_index)
         if decision != "cacheable_transform_driver":
@@ -839,8 +873,10 @@ def restore_values(armature, values):
         set_prop_value(armature, key, value)
 
 
-def bake_controls(context, armature, classification):
-    all_driver_bones = sorted(driver_bones_with_transform_drivers(armature))
+def bake_controls(context, armature, classification, excluded_driver_bones=None):
+    all_driver_bones = sorted(
+        driver_bones_with_transform_drivers(armature, excluded_driver_bones)
+    )
     controls = classification["controls"]
     original_values = {
         control["key"]: get_prop_value(armature, control["key"])
@@ -943,7 +979,8 @@ def compact_driver_audit_entry(armature, fcurve, pose_path, reason=None):
     return entry
 
 
-def cleanup_cached_bone_transform_drivers(armature, cache):
+def cleanup_cached_bone_transform_drivers(armature, cache, protected_bones=None):
+    protected_bones = protected_bones or set()
     cached_bones = cached_driver_bones(cache)
     trace_index = build_prop_driver_trace_index(armature)
     audit = {
@@ -963,6 +1000,17 @@ def cleanup_cached_bone_transform_drivers(armature, cache):
             continue
 
         decision = transform_driver_cache_decision(armature, fcurve, pose_path, trace_index)
+
+        if pose_path["bone_name"] in protected_bones:
+            audit["preserved"].append(
+                compact_driver_audit_entry(
+                    armature,
+                    fcurve,
+                    pose_path,
+                    "shape_key_bone_source_preserve",
+                )
+            )
+            continue
 
         if decision == "not_transform_channel":
             audit["ignored"].append(
@@ -1107,6 +1155,7 @@ def plan_shape_key_driver_cleanup(armature):
     plan = {
         "delete_fcurves": [],
         "preserved_prop_keys": set(),
+        "preserved_bone_sources": set(),
         "preserved": [],
         "removed": [],
     }
@@ -1118,7 +1167,12 @@ def plan_shape_key_driver_cleanup(armature):
         for fcurve in list(shape_keys.animation_data.drivers):
             shape_name = shape_key_name_from_data_path(fcurve.data_path)
             source_props = source_prop_refs_from_driver(armature, fcurve.driver)
+            direct_bone_sources = driver_bone_sources(fcurve.driver)
             trace = trace_prop_dependencies(source_props, trace_index)
+            trace_bone_sources = trace.get("bone_sources", set())
+            all_bone_sources = direct_bone_sources | trace_bone_sources
+            if direct_bone_sources:
+                trace["classification"] = "dynamic_bone_driven"
             entry = {
                 "mesh": mesh.name,
                 "shape_key": shape_name,
@@ -1128,9 +1182,12 @@ def plan_shape_key_driver_cleanup(armature):
                 entry["source_props"] = sorted(source_props)
             if trace["roots"]:
                 entry["root_props"] = sorted(trace["roots"], key=str.lower)
+            if all_bone_sources:
+                entry["source_bones"] = sorted(all_bone_sources, key=str.lower)
 
             if should_preserve_shape_key_driver(shape_name, trace):
                 plan["preserved_prop_keys"].update(trace["props"])
+                plan["preserved_bone_sources"].update(all_bone_sources)
                 plan["preserved"].append(entry)
                 continue
 
@@ -1142,6 +1199,10 @@ def plan_shape_key_driver_cleanup(armature):
 
 def protected_shape_key_prop_keys(armature):
     return plan_shape_key_driver_cleanup(armature)["preserved_prop_keys"]
+
+
+def protected_shape_key_bone_sources(armature):
+    return plan_shape_key_driver_cleanup(armature)["preserved_bone_sources"]
 
 
 def apply_shape_key_driver_cleanup(plan):
@@ -1447,9 +1508,9 @@ def delete_and_rebuild_props(armature, cache, classification, protected_prop_key
     return removed_prop_drivers, deleted_props, len(rebuild_controls)
 
 
-def make_cache(context, armature):
+def make_cache(context, armature, excluded_driver_bones=None):
     classification = build_classification(armature)
-    baked = bake_controls(context, armature, classification)
+    baked = bake_controls(context, armature, classification, excluded_driver_bones)
     print_debug_property_lists(armature, classification, baked)
     return {
         "schema_version": 2,
@@ -1862,7 +1923,12 @@ class DAZMHX_OT_v2_write_cache(bpy.types.Operator):
             self.report({"WARNING"}, "Select an armature.")
             return {"CANCELLED"}
 
-        cache, classification = make_cache(context, armature)
+        shape_key_plan = plan_shape_key_driver_cleanup(armature)
+        cache, classification = make_cache(
+            context,
+            armature,
+            shape_key_plan["preserved_bone_sources"],
+        )
         cache_path = write_cache_file(armature, cache)
         runtime_cache_for_armature(armature, force_reload=True)
 
@@ -1896,7 +1962,8 @@ class DAZMHX_OT_v2_delete_cached_bone_drivers(bpy.types.Operator):
             self.report({"WARNING"}, f"No V2 cache found at {cache_path}. Write the cache first.")
             return {"CANCELLED"}
 
-        audit = cleanup_cached_bone_transform_drivers(armature, cache)
+        protected_bones = protected_shape_key_bone_sources(armature)
+        audit = cleanup_cached_bone_transform_drivers(armature, cache, protected_bones)
         audit_path, summary = write_bone_driver_cleanup_audit(armature, audit)
         armature["daz_mhx_v2_cache_path"] = cache_path
         armature["daz_mhx_v2_bone_driver_cleanup_path"] = blend_relative_path(audit_path)
@@ -2021,12 +2088,17 @@ class DAZMHX_OT_v2_write_cache_and_clean(bpy.types.Operator):
             self.report({"WARNING"}, "Select an armature.")
             return {"CANCELLED"}
 
-        cache, classification = make_cache(context, armature)
+        shape_key_plan = plan_shape_key_driver_cleanup(armature)
+        cache, classification = make_cache(
+            context,
+            armature,
+            shape_key_plan["preserved_bone_sources"],
+        )
         cache_path = write_cache_file(armature, cache)
         classification = build_classification(armature)
-        shape_key_plan = plan_shape_key_driver_cleanup(armature)
         protected_prop_keys = shape_key_plan["preserved_prop_keys"]
-        audit = cleanup_cached_bone_transform_drivers(armature, cache)
+        protected_bones = shape_key_plan["preserved_bone_sources"]
+        audit = cleanup_cached_bone_transform_drivers(armature, cache, protected_bones)
         audit_path, audit_summary = write_bone_driver_cleanup_audit(armature, audit)
         removed_transform_drivers = audit_summary["removed_driver_count"]
         prop_audit, _deleted_record_ids = cleanup_cached_prop_drivers(
