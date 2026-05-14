@@ -4,6 +4,7 @@ import re
 from collections import defaultdict, deque
 
 import bpy
+from bpy.app.handlers import persistent
 from mathutils import Matrix, Quaternion, Vector
 
 
@@ -27,6 +28,16 @@ _RUNTIME_CACHES = {}
 _APPLYING = False
 _SUPPRESS_RNA_UPDATE = False
 _RNA_CONTROL_PROPS = set()
+
+
+@persistent
+def clear_runtime_caches_on_undo(_scene):
+    _RUNTIME_CACHES.clear()
+
+
+@persistent
+def clear_runtime_caches_on_load(_dummy):
+    _RUNTIME_CACHES.clear()
 
 
 def selected_armature(context):
@@ -1859,9 +1870,17 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    if clear_runtime_caches_on_undo not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(clear_runtime_caches_on_undo)
+    if clear_runtime_caches_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(clear_runtime_caches_on_load)
 
 
 def unregister():
+    if clear_runtime_caches_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(clear_runtime_caches_on_load)
+    if clear_runtime_caches_on_undo in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(clear_runtime_caches_on_undo)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     for prop_name in list(_RNA_CONTROL_PROPS):
