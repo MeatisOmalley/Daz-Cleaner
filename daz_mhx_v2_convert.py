@@ -102,6 +102,11 @@ def custom_properties_from_path(data_path):
     return CUSTOM_PROPERTY_PATH_RE.findall(data_path or "")
 
 
+def shape_key_name_from_data_path(data_path):
+    match = re.search(r'key_blocks\["([^"]+)"\]\.value', data_path or "")
+    return match.group(1) if match else None
+
+
 def parse_pose_bone_data_path(data_path):
     match = POSE_BONE_PATH_RE.match(data_path or "")
     if not match:
@@ -430,7 +435,7 @@ def constraint_source_props(driver_records):
 
 
 def is_protected_prop_name(name):
-    return name.startswith(("Mha", "pCTRL"))
+    return name.startswith(("Mha", "pCTRL", "pJCM"))
 
 
 def ancestor_props(seed_props, reverse_edges):
@@ -891,6 +896,9 @@ def delete_shape_key_drivers(armature):
         if not shape_keys or not shape_keys.animation_data:
             continue
         for fcurve in list(shape_keys.animation_data.drivers):
+            shape_name = shape_key_name_from_data_path(fcurve.data_path)
+            if shape_name and shape_name.startswith("pJCM"):
+                continue
             shape_keys.animation_data.drivers.remove(fcurve)
             removed += 1
     return removed
@@ -1069,13 +1077,13 @@ def cleanup_driven_data_props(armature):
             continue
 
         name = names[0]
-        if "pCTRL" in name:
+        if "pCTRL" in name or name.startswith("pJCM"):
             audit["preserved"].append(
                 compact_data_prop_driver_entry(
                     armature,
                     fcurve,
                     name,
-                    "pCTRL",
+                    "protected_pose_corrective",
                 )
             )
             continue
