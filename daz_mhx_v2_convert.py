@@ -973,6 +973,38 @@ def cached_driver_bones(cache):
     return bones
 
 
+def preserved_bone_driver_prop_keys(armature, cache=None, protected_bones=None):
+    protected_bones = protected_bones or set()
+    cached_bones = cached_driver_bones(cache)
+    trace_index = build_prop_driver_trace_index(armature)
+    protected = set()
+
+    if not armature.animation_data:
+        return protected
+
+    for fcurve in armature.animation_data.drivers:
+        pose_path = parse_pose_bone_data_path(fcurve.data_path)
+        if not pose_path or pose_path["channel_base"] not in SAFE_CHANNELS:
+            continue
+
+        decision = transform_driver_cache_decision(armature, fcurve, pose_path, trace_index)
+        will_delete = decision == "constant_zero_delete"
+        will_delete = will_delete or (
+            decision == "cacheable_transform_driver"
+            and pose_path["bone_name"] in cached_bones
+            and pose_path["bone_name"] not in protected_bones
+        )
+        if will_delete:
+            continue
+
+        source_props = source_prop_refs_from_driver(armature, fcurve.driver)
+        trace = trace_prop_dependencies(source_props, trace_index)
+        protected.update(source_props)
+        protected.update(trace["props"])
+
+    return protected
+
+
 def compact_driver_audit_entry(armature, fcurve, pose_path, reason=None):
     entry = {
         "bone": pose_path["bone_name"],
@@ -2034,6 +2066,7 @@ class DAZMHX_OT_v2_delete_cached_prop_drivers(bpy.types.Operator):
 
         classification = build_classification(armature)
         protected_prop_keys = protected_shape_key_prop_keys(armature)
+        protected_prop_keys.update(preserved_bone_driver_prop_keys(armature, cache))
         audit, _deleted_record_ids = cleanup_cached_prop_drivers(
             armature,
             cache,
@@ -2075,6 +2108,7 @@ class DAZMHX_OT_v2_delete_driven_data_props(bpy.types.Operator):
             return {"CANCELLED"}
 
         protected_prop_keys = protected_shape_key_prop_keys(armature)
+        protected_prop_keys.update(preserved_bone_driver_prop_keys(armature))
         audit = cleanup_driven_data_props(armature, protected_prop_keys)
         audit_path, summary = write_data_prop_cleanup_audit(armature, audit)
         armature["daz_mhx_v2_data_prop_cleanup_path"] = blend_relative_path(audit_path)
@@ -2120,6 +2154,9 @@ class DAZMHX_OT_v2_write_cache_and_clean(bpy.types.Operator):
         classification = build_classification(armature)
         protected_prop_keys = shape_key_plan["preserved_prop_keys"]
         protected_bones = shape_key_plan["preserved_bone_sources"]
+        protected_prop_keys.update(
+            preserved_bone_driver_prop_keys(armature, cache, protected_bones)
+        )
         audit = cleanup_cached_bone_transform_drivers(armature, cache, protected_bones)
         audit_path, audit_summary = write_bone_driver_cleanup_audit(armature, audit)
         removed_transform_drivers = audit_summary["removed_driver_count"]
