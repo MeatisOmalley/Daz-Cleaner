@@ -24,6 +24,43 @@ def clear_animation_drivers(id_block):
     return removed
 
 
+def set_driver_mute(id_block, mute, predicate=None):
+    if not id_block or not id_block.animation_data:
+        return 0
+
+    changed = 0
+    for fcurve in id_block.animation_data.drivers:
+        if predicate and not predicate(fcurve):
+            continue
+        if fcurve.mute == mute:
+            continue
+        fcurve.mute = mute
+        changed += 1
+    return changed
+
+
+def is_bone_driver_fcurve(fcurve):
+    return fcurve.data_path.startswith("pose.bones[")
+
+
+def set_armature_driver_mute(armature, mute):
+    changed = set_driver_mute(
+        armature,
+        mute,
+        predicate=lambda fcurve: not is_bone_driver_fcurve(fcurve),
+    )
+    changed += set_driver_mute(armature.data, mute)
+    return changed
+
+
+def set_bone_driver_mute(armature, mute):
+    return set_driver_mute(
+        armature,
+        mute,
+        predicate=is_bone_driver_fcurve,
+    )
+
+
 def clear_modifiers(obj):
     removed = len(obj.modifiers)
     for modifier in list(obj.modifiers):
@@ -242,6 +279,52 @@ class CLEAN_OT_delete_selected(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CLEAN_OT_mute_selected_drivers(bpy.types.Operator):
+    bl_idname = "clean.mute_selected_drivers"
+    bl_label = "Mute Selected Drivers"
+    bl_description = "Mute or unmute drivers on selected armatures without deleting them"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target: bpy.props.EnumProperty(
+        name="Driver Target",
+        items=[
+            ("ARMATURE", "Armature Drivers", "Mute armature object/data drivers, excluding pose-bone drivers"),
+            ("BONE", "Bone Drivers", "Mute pose-bone drivers on selected armatures"),
+            ("BOTH", "Armature and Bone Drivers", "Mute armature object/data and pose-bone drivers"),
+        ],
+        default="BOTH",
+    )
+
+    mute: bpy.props.BoolProperty(
+        name="Mute",
+        default=True,
+    )
+
+    def execute(self, context):
+        armatures = [obj for obj in context.selected_objects if obj.type == "ARMATURE"]
+        if not armatures:
+            self.report({"WARNING"}, "No selected armatures.")
+            return {"CANCELLED"}
+
+        changed_armature = 0
+        changed_bone = 0
+        for armature in armatures:
+            if self.target in {"ARMATURE", "BOTH"}:
+                changed_armature += set_armature_driver_mute(armature, self.mute)
+            if self.target in {"BONE", "BOTH"}:
+                changed_bone += set_bone_driver_mute(armature, self.mute)
+
+        action = "Muted" if self.mute else "Unmuted"
+        self.report(
+            {"INFO"},
+            (
+                f"{action} {changed_armature} armature drivers and "
+                f"{changed_bone} bone drivers on {len(armatures)} armature(s)."
+            ),
+        )
+        return {"FINISHED"}
+
+
 class CLEAN_PT_selection_cleaner(bpy.types.Panel):
     bl_label = "Selection Cleaner"
     bl_idname = "CLEAN_PT_selection_cleaner"
@@ -288,12 +371,39 @@ class CLEAN_PT_selection_cleaner(bpy.types.Panel):
 
             bone_col.separator()
 
+            op = bone_col.operator("clean.mute_selected_drivers", text="Mute Armature Drivers")
+            op.target = "ARMATURE"
+            op.mute = True
+
+            op = bone_col.operator("clean.mute_selected_drivers", text="Unmute Armature Drivers")
+            op.target = "ARMATURE"
+            op.mute = False
+
+            op = bone_col.operator("clean.mute_selected_drivers", text="Mute Bone Drivers")
+            op.target = "BONE"
+            op.mute = True
+
+            op = bone_col.operator("clean.mute_selected_drivers", text="Unmute Bone Drivers")
+            op.target = "BONE"
+            op.mute = False
+
+            op = bone_col.operator("clean.mute_selected_drivers", text="Mute Armature + Bone Drivers")
+            op.target = "BOTH"
+            op.mute = True
+
+            op = bone_col.operator("clean.mute_selected_drivers", text="Unmute Armature + Bone Drivers")
+            op.target = "BOTH"
+            op.mute = False
+
+            bone_col.separator()
+
             op = bone_col.operator("clean.delete_selected", text="Delete All Bone Data")
             op.cleanup_type = "BONE_ALL"
 
 
 classes = (
     CLEAN_OT_delete_selected,
+    CLEAN_OT_mute_selected_drivers,
     CLEAN_PT_selection_cleaner,
 )
 
