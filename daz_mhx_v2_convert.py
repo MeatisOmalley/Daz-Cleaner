@@ -28,16 +28,20 @@ _RUNTIME_CACHES = {}
 _APPLYING = False
 _SUPPRESS_RNA_UPDATE = False
 _RNA_CONTROL_PROPS = set()
+_DIRTY_ARMATURES = set()
+_DIRTY_TIMER_REGISTERED = False
 
 
 @persistent
 def clear_runtime_caches_on_undo(_scene):
     _RUNTIME_CACHES.clear()
+    _DIRTY_ARMATURES.clear()
 
 
 @persistent
 def clear_runtime_caches_on_load(_dummy):
     _RUNTIME_CACHES.clear()
+    _DIRTY_ARMATURES.clear()
 
 
 def selected_armature(context):
@@ -1372,7 +1376,6 @@ def rna_prop_options_from_ui(ui):
 
 def make_rna_update_callback(prop_name):
     def update(self, context):
-        global _APPLYING
         if _SUPPRESS_RNA_UPDATE or _APPLYING:
             return
         if not self or self.type != "ARMATURE":
@@ -1388,14 +1391,7 @@ def make_rna_update_callback(prop_name):
 
         value = float(getattr(self, prop_name))
         morph["id_block"][morph["name"]] = value
-
-        _APPLYING = True
-        try:
-            apply_runtime_cache(self, runtime, force=True)
-            if context:
-                context.view_layer.update()
-        finally:
-            _APPLYING = False
+        mark_armature_dirty(self)
 
     return update
 
@@ -1430,6 +1426,46 @@ def sync_rna_controls_from_id_props(armature, runtime):
             morph["last_value"] = value
     finally:
         _SUPPRESS_RNA_UPDATE = False
+
+
+def flush_dirty_armatures():
+    global _APPLYING, _DIRTY_TIMER_REGISTERED
+    _DIRTY_TIMER_REGISTERED = False
+    dirty = list(_DIRTY_ARMATURES)
+    _DIRTY_ARMATURES.clear()
+    if not dirty:
+        return None
+
+    _APPLYING = True
+    try:
+        for pointer in dirty:
+            armature = None
+            for obj in bpy.data.objects:
+                if obj.type == "ARMATURE" and obj.as_pointer() == pointer:
+                    armature = obj
+                    break
+            if not armature:
+                continue
+
+            runtime = runtime_cache_for_armature(armature)
+            if not runtime:
+                continue
+            apply_runtime_cache(armature, runtime, force=True)
+    finally:
+        _APPLYING = False
+
+    return None
+
+
+def mark_armature_dirty(armature):
+    global _DIRTY_TIMER_REGISTERED
+    if not armature or armature.type != "ARMATURE":
+        return
+    _DIRTY_ARMATURES.add(armature.as_pointer())
+    if _DIRTY_TIMER_REGISTERED:
+        return
+    _DIRTY_TIMER_REGISTERED = True
+    bpy.app.timers.register(flush_dirty_armatures, first_interval=0.0)
 
 
 def apply_runtime_cache(armature, runtime, force=False):
@@ -1885,6 +1921,7 @@ def register():
 
 
 def unregister():
+    global _DIRTY_TIMER_REGISTERED
     if clear_runtime_caches_on_load in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(clear_runtime_caches_on_load)
     if clear_runtime_caches_on_undo in bpy.app.handlers.undo_post:
@@ -1896,6 +1933,8 @@ def unregister():
             delattr(bpy.types.Object, prop_name)
     _RNA_CONTROL_PROPS.clear()
     _RUNTIME_CACHES.clear()
+    _DIRTY_ARMATURES.clear()
+    _DIRTY_TIMER_REGISTERED = False
 
 
 if __name__ == "__main__":
