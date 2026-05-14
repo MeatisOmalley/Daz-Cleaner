@@ -341,10 +341,26 @@ def copy_transform_links_by_driver_bone(armature):
     return links
 
 
+def driver_bones_with_transform_drivers(armature):
+    bones = set()
+    if not armature.animation_data:
+        return bones
+
+    for fcurve in armature.animation_data.drivers:
+        pose_path = parse_pose_bone_data_path(fcurve.data_path)
+        if not pose_path:
+            continue
+        if not pose_path["is_driver_bone"]:
+            continue
+        if pose_path["channel_base"] not in SAFE_CHANNELS:
+            continue
+        bones.add(pose_path["bone_name"])
+    return bones
+
+
 def bone_transform_source_props(armature, driver_records):
     refs = set()
     transform_drivers = []
-    links_by_driver_bone = copy_transform_links_by_driver_bone(armature)
     for record in driver_records:
         pose_path = record["pose_path"]
         if not pose_path:
@@ -352,8 +368,6 @@ def bone_transform_source_props(armature, driver_records):
         if pose_path["channel_base"] not in SAFE_CHANNELS:
             continue
         if not pose_path["is_driver_bone"]:
-            continue
-        if pose_path["bone_name"] not in links_by_driver_bone:
             continue
 
         refs.update(record["source_props"])
@@ -631,8 +645,7 @@ def restore_values(armature, values):
 
 
 def bake_controls(context, armature, classification):
-    links_by_driver_bone = copy_transform_links_by_driver_bone(armature)
-    all_driver_bones = sorted(links_by_driver_bone)
+    all_driver_bones = sorted(driver_bones_with_transform_drivers(armature))
     controls = classification["controls"]
     original_values = {
         control["key"]: get_prop_value(armature, control["key"])
