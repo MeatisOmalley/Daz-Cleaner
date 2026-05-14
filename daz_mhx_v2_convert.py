@@ -260,6 +260,112 @@ def source_prop_refs_from_driver(armature, driver):
     return refs
 
 
+def driver_has_bone_source(driver):
+    for variable in driver.variables:
+        for target in variable.targets:
+            data_path = getattr(target, "data_path", "") or ""
+            if custom_properties_from_path(data_path):
+                continue
+            if getattr(target, "bone_target", ""):
+                return True
+            if getattr(target, "transform_type", ""):
+                return True
+            if data_path.startswith("pose.bones[") or ".pose.bones[" in data_path:
+                return True
+    return False
+
+
+def prop_name_category(name):
+    if name.startswith("pJCM"):
+        return "pose_corrective"
+    if "pCTRL" in name:
+        return "pose_control"
+    if name.startswith("Mha"):
+        return "rig_setting"
+    if name.startswith(("eCTRL", "eJCM", "facs_bs", "facs_cbs")):
+        return "expression_or_face_morph"
+    if name.startswith(("PBM", "PHM", "FBM", "MCM", "CTRL")):
+        return "body_morph"
+    if any(token in name for token in ("(fin)", "(rst)", "_div2")):
+        return "computed_intermediate"
+    return "other"
+
+
+def trace_classification_for_roots(root_names, has_bone_source):
+    if has_bone_source:
+        return "dynamic_bone_driven"
+
+    categories = {prop_name_category(name) for name in root_names}
+    if not categories:
+        return "constant_or_empty"
+    if categories.intersection({"pose_corrective", "pose_control"}):
+        return "pose_corrective_prop_driven"
+    if "rig_setting" in categories:
+        return "rig_setting_driven"
+    if categories and categories.issubset(
+        {
+            "expression_or_face_morph",
+            "body_morph",
+            "computed_intermediate",
+            "other",
+        }
+    ):
+        return "morph_or_expression_driven"
+    return "mixed_or_unknown"
+
+
+def build_prop_driver_trace_index(armature):
+    index = {}
+    for scope in ("object", "data"):
+        id_block = id_block_for_scope(armature, scope)
+        if not id_block or not id_block.animation_data:
+            continue
+
+        for fcurve in id_block.animation_data.drivers:
+            output_prop = output_prop_ref_from_fcurve(armature, scope, fcurve)
+            if not output_prop:
+                continue
+            index[output_prop] = {
+                "source_props": source_prop_refs_from_driver(armature, fcurve.driver),
+                "has_bone_source": driver_has_bone_source(fcurve.driver),
+            }
+    return index
+
+
+def trace_prop_dependencies(seed_props, trace_index, max_depth=16):
+    visited = set()
+    roots = set()
+    has_bone_source = False
+    queue = deque((prop, 0) for prop in seed_props)
+
+    while queue:
+        key, depth = queue.popleft()
+        if key in visited:
+            continue
+        visited.add(key)
+
+        record = trace_index.get(key)
+        if not record or depth >= max_depth:
+            roots.add(split_prop_key(key)[1])
+            continue
+
+        has_bone_source = has_bone_source or record.get("has_bone_source", False)
+        source_props = record.get("source_props", set())
+        if not source_props:
+            roots.add(split_prop_key(key)[1])
+            continue
+
+        for source_prop in source_props:
+            queue.append((source_prop, depth + 1))
+
+    return {
+        "props": visited,
+        "roots": roots,
+        "has_bone_source": has_bone_source,
+        "classification": trace_classification_for_roots(roots, has_bone_source),
+    }
+
+
 def output_prop_ref_from_fcurve(armature, owner_scope, fcurve):
     names = custom_properties_from_path(fcurve.data_path)
     if not names:
@@ -909,19 +1015,74 @@ def delete_safe_driver_bone_transform_drivers(armature):
     return delete_transform_drivers(armature, safe_driver_bones)
 
 
-def delete_shape_key_drivers(armature):
-    removed = 0
+def should_preserve_shape_key_driver(shape_name, trace):
+    if shape_name and shape_name.startswith("pJCM"):
+        return True
+    return trace["classification"] in {
+        "dynamic_bone_driven",
+        "pose_corrective_prop_driven",
+        "rig_setting_driven",
+        "mixed_or_unknown",
+    }
+
+
+def plan_shape_key_driver_cleanup(armature):
+    trace_index = build_prop_driver_trace_index(armature)
+    plan = {
+        "delete_fcurves": [],
+        "preserved_prop_keys": set(),
+        "preserved": [],
+        "removed": [],
+    }
+
     for mesh in related_meshes(armature):
         shape_keys = mesh.data.shape_keys
         if not shape_keys or not shape_keys.animation_data:
             continue
         for fcurve in list(shape_keys.animation_data.drivers):
             shape_name = shape_key_name_from_data_path(fcurve.data_path)
-            if shape_name and shape_name.startswith("pJCM"):
+            source_props = source_prop_refs_from_driver(armature, fcurve.driver)
+            trace = trace_prop_dependencies(source_props, trace_index)
+            entry = {
+                "mesh": mesh.name,
+                "shape_key": shape_name,
+                "classification": trace["classification"],
+            }
+            if source_props:
+                entry["source_props"] = sorted(source_props)
+            if trace["roots"]:
+                entry["root_props"] = sorted(trace["roots"], key=str.lower)
+
+            if should_preserve_shape_key_driver(shape_name, trace):
+                plan["preserved_prop_keys"].update(trace["props"])
+                plan["preserved"].append(entry)
                 continue
+
+            plan["delete_fcurves"].append((shape_keys, fcurve))
+            plan["removed"].append(entry)
+
+    return plan
+
+
+def protected_shape_key_prop_keys(armature):
+    return plan_shape_key_driver_cleanup(armature)["preserved_prop_keys"]
+
+
+def apply_shape_key_driver_cleanup(plan):
+    removed = 0
+    for shape_keys, fcurve in plan.get("delete_fcurves", []):
+        if not shape_keys.animation_data:
+            continue
+        try:
             shape_keys.animation_data.drivers.remove(fcurve)
             removed += 1
+        except RuntimeError:
+            pass
     return removed
+
+
+def delete_shape_key_drivers(armature, plan=None):
+    return apply_shape_key_driver_cleanup(plan or plan_shape_key_driver_cleanup(armature))
 
 
 def remove_prop_driver(id_block, name):
@@ -976,11 +1137,12 @@ def compact_prop_driver_audit_entry(record, reason=None):
     return entry
 
 
-def cleanup_cached_prop_drivers(armature, cache, classification):
+def cleanup_cached_prop_drivers(armature, cache, classification, protected_prop_keys=None):
     cache_keys = cached_prop_keys(cache)
     cache_names = cached_prop_names(cache)
     internal_keys = {item["key"] for item in classification["internal_delete_props"]}
     protected_keys = {item["key"] for item in classification["protected_props"]}
+    protected_keys.update(protected_prop_keys or set())
     constraint_keys = set(classification["constraint_touched_props"])
     deleted_record_ids = set()
     audit = {
@@ -1070,7 +1232,8 @@ def compact_data_prop_driver_entry(armature, fcurve, name, reason=None):
     return entry
 
 
-def cleanup_driven_data_props(armature):
+def cleanup_driven_data_props(armature, protected_prop_keys=None):
+    protected_prop_keys = protected_prop_keys or set()
     audit = {
         "armature": armature.name,
         "removed": [],
@@ -1097,6 +1260,17 @@ def cleanup_driven_data_props(armature):
             continue
 
         name = names[0]
+        if prop_key("data", name) in protected_prop_keys:
+            audit["preserved"].append(
+                compact_data_prop_driver_entry(
+                    armature,
+                    fcurve,
+                    name,
+                    "protected_upstream_shape_key_dependency",
+                )
+            )
+            continue
+
         if "pCTRL" in name or name.startswith("pJCM"):
             audit["preserved"].append(
                 compact_data_prop_driver_entry(
@@ -1161,16 +1335,19 @@ def write_data_prop_cleanup_audit(armature, audit):
     return path, summary
 
 
-def delete_and_rebuild_props(armature, cache, classification):
+def delete_and_rebuild_props(armature, cache, classification, protected_prop_keys=None):
+    protected_prop_keys = protected_prop_keys or set()
     removed_prop_drivers = 0
     deleted_props = 0
     rebuild_controls = {
         prop_key(morph["scope"], morph["name"]): morph
         for morph in cache["morphs"]
         if not is_protected_prop_name(morph["name"])
+        and prop_key(morph["scope"], morph["name"]) not in protected_prop_keys
     }
     delete_keys = set(rebuild_controls)
     delete_keys.update(item["key"] for item in classification["internal_delete_props"])
+    delete_keys.difference_update(protected_prop_keys)
 
     for key in sorted(delete_keys):
         scope, name = split_prop_key(key)
@@ -1691,7 +1868,13 @@ class DAZMHX_OT_v2_delete_cached_prop_drivers(bpy.types.Operator):
             return {"CANCELLED"}
 
         classification = build_classification(armature)
-        audit, _deleted_record_ids = cleanup_cached_prop_drivers(armature, cache, classification)
+        protected_prop_keys = protected_shape_key_prop_keys(armature)
+        audit, _deleted_record_ids = cleanup_cached_prop_drivers(
+            armature,
+            cache,
+            classification,
+            protected_prop_keys,
+        )
         audit_path, summary = write_prop_driver_cleanup_audit(armature, audit)
         armature["daz_mhx_v2_cache_path"] = cache_path
         armature["daz_mhx_v2_prop_driver_cleanup_path"] = blend_relative_path(audit_path)
@@ -1726,7 +1909,8 @@ class DAZMHX_OT_v2_delete_driven_data_props(bpy.types.Operator):
             self.report({"WARNING"}, "Select an armature.")
             return {"CANCELLED"}
 
-        audit = cleanup_driven_data_props(armature)
+        protected_prop_keys = protected_shape_key_prop_keys(armature)
+        audit = cleanup_driven_data_props(armature, protected_prop_keys)
         audit_path, summary = write_data_prop_cleanup_audit(armature, audit)
         armature["daz_mhx_v2_data_prop_cleanup_path"] = blend_relative_path(audit_path)
         armature["daz_mhx_v2_removed_data_prop_drivers"] = summary["removed_driver_count"]
@@ -1764,6 +1948,8 @@ class DAZMHX_OT_v2_write_cache_and_clean(bpy.types.Operator):
         cache, classification = make_cache(context, armature)
         cache_path = write_cache_file(armature, cache)
         classification = build_classification(armature)
+        shape_key_plan = plan_shape_key_driver_cleanup(armature)
+        protected_prop_keys = shape_key_plan["preserved_prop_keys"]
         audit = cleanup_cached_bone_transform_drivers(armature, cache)
         audit_path, audit_summary = write_bone_driver_cleanup_audit(armature, audit)
         removed_transform_drivers = audit_summary["removed_driver_count"]
@@ -1771,21 +1957,23 @@ class DAZMHX_OT_v2_write_cache_and_clean(bpy.types.Operator):
             armature,
             cache,
             classification,
+            protected_prop_keys,
         )
         prop_audit_path, prop_audit_summary = write_prop_driver_cleanup_audit(
             armature,
             prop_audit,
         )
-        data_prop_audit = cleanup_driven_data_props(armature)
+        data_prop_audit = cleanup_driven_data_props(armature, protected_prop_keys)
         data_prop_audit_path, data_prop_summary = write_data_prop_cleanup_audit(
             armature,
             data_prop_audit,
         )
-        removed_shape_key_drivers = delete_shape_key_drivers(armature)
+        removed_shape_key_drivers = delete_shape_key_drivers(armature, shape_key_plan)
         removed_prop_drivers, deleted_props, rebuilt_props = delete_and_rebuild_props(
             armature,
             cache,
             classification,
+            protected_prop_keys,
         )
         removed_prop_drivers += prop_audit_summary["removed_driver_count"]
         removed_prop_drivers += data_prop_summary["removed_driver_count"]
