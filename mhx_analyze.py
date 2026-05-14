@@ -21,6 +21,7 @@ bl_info = {
 OUTPUT_DIR = r"C:\Users\meat\Documents\blender\code\Daz Cleaner"
 DEFAULT_OUTPUT_FILENAME = "mhx_analysis.json"
 DEFAULT_BONE_DRIVER_OUTPUT_FILENAME = "mhx_bone_drivers.json"
+DEFAULT_SHAPE_KEY_OUTPUT_FILENAME = "mhx_shape_keys.json"
 
 POSE_BONE_PATH_RE = re.compile(r'pose\.bones\["([^"]+)"\]\.(.+)')
 CUSTOM_PROPERTY_PATH_RE = re.compile(r'\["([^"]+)"\]')
@@ -269,6 +270,29 @@ def prop_name_category(name):
         return "mhx_rig_setting"
     if name.startswith(("G 101", "SG", "HG", "GR", "SCR")):
         return "vendor_or_custom_asset"
+    return "other"
+
+
+def shape_key_name_category(name):
+    lower = name.lower()
+    if name == "Basis":
+        return "basis"
+    if name.startswith(("pJCM", "JCM", "MCM")) or "jcm" in lower:
+        return "joint_corrective"
+    if "corrective" in lower or lower.startswith(("adj", "fix")):
+        return "corrective"
+    if name.startswith(("eCTRL", "ECTRL")):
+        return "expression_control"
+    if name.startswith(("facs_", "FACS")):
+        return "facs"
+    if name.startswith(("PBM", "PHM", "FBM")):
+        return "daz_morph"
+    if name.startswith("Mha"):
+        return "mhx_rig_setting"
+    if name.startswith(("CTRL", "pCTRL")):
+        return "pose_control"
+    if re.match(r"^[lr][A-Z]", name):
+        return "side_named"
     return "other"
 
 
@@ -724,6 +748,116 @@ def collect_compact_bone_driver_report(armature):
     }
 
 
+def shape_key_name_from_data_path(data_path):
+    match = re.search(r'key_blocks\["([^"]+)"\]\.value', data_path or "")
+    return match.group(1) if match else None
+
+
+def compact_shape_key_driver(fcurve):
+    driver = fcurve.driver
+    return {
+        "expression": driver.expression,
+        "array_index": fcurve.array_index,
+        "variables": compact_source_refs(collect_driver_source_refs(driver)),
+    }
+
+
+def collect_compact_shape_key_report(armature):
+    meshes = []
+    total_shape_keys = 0
+    driven_shape_keys = 0
+    total_drivers = 0
+    category_counts = Counter()
+    driven_category_counts = Counter()
+    source_prop_counts = Counter()
+    source_category_counts = Counter()
+    expression_counts = Counter()
+
+    for mesh_obj in related_meshes_for_armature(armature):
+        shape_keys = getattr(mesh_obj.data, "shape_keys", None)
+        if not shape_keys:
+            continue
+
+        drivers_by_shape = defaultdict(list)
+        if shape_keys.animation_data:
+            for fcurve in shape_keys.animation_data.drivers:
+                shape_name = shape_key_name_from_data_path(fcurve.data_path)
+                if not shape_name:
+                    continue
+
+                driver_record = compact_shape_key_driver(fcurve)
+                drivers_by_shape[shape_name].append(driver_record)
+                total_drivers += 1
+                expression_counts[driver_record["expression"]] += 1
+                for variable in driver_record["variables"]:
+                    prop_name = variable.get("property")
+                    if prop_name:
+                        source_prop_counts[prop_name] += 1
+                        source_category_counts[prop_name_category(prop_name)] += 1
+
+        sparse_keys = []
+        for key_block in shape_keys.key_blocks:
+            name = key_block.name
+            if name == "Basis":
+                continue
+
+            total_shape_keys += 1
+            category = shape_key_name_category(name)
+            category_counts[category] += 1
+            drivers = drivers_by_shape.get(name, [])
+            if drivers:
+                driven_shape_keys += 1
+                driven_category_counts[category] += 1
+
+            sparse_keys.append(
+                {
+                    "name": name,
+                    "category": category,
+                    "driver_count": len(drivers),
+                    "drivers": drivers,
+                }
+            )
+
+        meshes.append(
+            {
+                "name": mesh_obj.name,
+                "shape_key_count": len(sparse_keys),
+                "driven_shape_key_count": sum(
+                    1 for item in sparse_keys if item["driver_count"]
+                ),
+                "shape_keys": sorted(
+                    sparse_keys,
+                    key=lambda item: (
+                        item["category"],
+                        item["name"].lower(),
+                    ),
+                ),
+            }
+        )
+
+    return {
+        "armature": armature.name,
+        "summary": {
+            "mesh_count": len(meshes),
+            "shape_key_count": total_shape_keys,
+            "driven_shape_key_count": driven_shape_keys,
+            "shape_key_driver_count": total_drivers,
+            "category_counts": dict(category_counts),
+            "driven_category_counts": dict(driven_category_counts),
+            "source_category_counts": dict(source_category_counts),
+            "top_source_properties": [
+                {"name": name, "ref_count": count, "category": prop_name_category(name)}
+                for name, count in source_prop_counts.most_common(50)
+            ],
+            "top_expressions": [
+                {"expression": expression, "count": count}
+                for expression, count in expression_counts.most_common(25)
+            ],
+        },
+        "meshes": meshes,
+    }
+
+
 def collect_bone_data(armature):
     bones = []
     data_bones = armature.data.bones if armature.data else {}
@@ -910,12 +1044,29 @@ def build_bone_driver_report(context):
     }
 
 
+def build_shape_key_report(context):
+    armatures = selected_armatures(context)
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "blend_file": bpy.data.filepath,
+        "selected_armatures": [
+            collect_compact_shape_key_report(armature)
+            for armature in armatures
+        ],
+    }
+
+
 def default_output_path():
     return os.path.join(OUTPUT_DIR, DEFAULT_OUTPUT_FILENAME)
 
 
 def default_bone_driver_output_path():
     return os.path.join(OUTPUT_DIR, DEFAULT_BONE_DRIVER_OUTPUT_FILENAME)
+
+
+def default_shape_key_output_path():
+    return os.path.join(OUTPUT_DIR, DEFAULT_SHAPE_KEY_OUTPUT_FILENAME)
 
 
 class MHX_OT_export_analysis_json(bpy.types.Operator):
@@ -976,6 +1127,35 @@ class MHX_OT_export_bone_drivers_json(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MHX_OT_export_shape_keys_json(bpy.types.Operator):
+    bl_idname = "mhx.export_shape_keys_json"
+    bl_label = "Export Shape Keys JSON"
+    bl_description = "Export a compact list of shape keys, drivers, expressions, and variable sources"
+    bl_options = {"REGISTER"}
+
+    output_path: bpy.props.StringProperty(
+        name="Output Path",
+        subtype="FILE_PATH",
+        default=default_shape_key_output_path(),
+    )
+
+    def execute(self, context):
+        if not selected_armatures(context):
+            self.report({"WARNING"}, "Select at least one armature.")
+            return {"CANCELLED"}
+
+        path = bpy.path.abspath(self.output_path)
+        output_dir = os.path.dirname(path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(build_shape_key_report(context), handle, indent=2, sort_keys=True)
+
+        self.report({"INFO"}, f"Wrote compact shape key JSON: {path}")
+        return {"FINISHED"}
+
+
 class MHX_PT_rig_analyzer(bpy.types.Panel):
     bl_label = "MHX Rig Analyzer"
     bl_idname = "MHX_PT_rig_analyzer"
@@ -990,11 +1170,13 @@ class MHX_PT_rig_analyzer(bpy.types.Panel):
         layout.label(text=f"Selected armatures: {selected_count}")
         layout.operator("mhx.export_analysis_json", text="Export Analysis JSON")
         layout.operator("mhx.export_bone_drivers_json", text="Export Bone Drivers JSON")
+        layout.operator("mhx.export_shape_keys_json", text="Export Shape Keys JSON")
 
 
 classes = (
     MHX_OT_export_analysis_json,
     MHX_OT_export_bone_drivers_json,
+    MHX_OT_export_shape_keys_json,
     MHX_PT_rig_analyzer,
 )
 
