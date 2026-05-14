@@ -402,9 +402,6 @@ def transform_driver_cache_decision(armature, fcurve, pose_path, trace_index):
     if pose_path["channel_base"] not in SAFE_CHANNELS:
         return "not_transform_channel"
 
-    if is_constant_zero_expression(fcurve.driver.expression if fcurve.driver else ""):
-        return "constant_zero_delete"
-
     if not fcurve.driver:
         return "missing_driver"
 
@@ -421,6 +418,9 @@ def transform_driver_cache_decision(armature, fcurve, pose_path, trace_index):
         return "dynamic_bone_source_preserve"
     if trace["classification"] == "rig_setting_driven":
         return "rig_setting_preserve"
+
+    if is_constant_zero_expression(fcurve.driver.expression):
+        return "constant_zero_delete"
 
     return "cacheable_transform_driver"
 
@@ -1133,6 +1133,7 @@ def delete_transform_drivers(armature, affected_driver_bones):
         return 0
 
     removed = 0
+    trace_index = build_prop_driver_trace_index(armature)
     for fcurve in list(armature.animation_data.drivers):
         pose_path = parse_pose_bone_data_path(fcurve.data_path)
         if not pose_path:
@@ -1140,6 +1141,9 @@ def delete_transform_drivers(armature, affected_driver_bones):
         if pose_path["bone_name"] not in affected_driver_bones:
             continue
         if pose_path["channel_base"] not in SAFE_CHANNELS:
+            continue
+        decision = transform_driver_cache_decision(armature, fcurve, pose_path, trace_index)
+        if decision not in {"cacheable_transform_driver", "constant_zero_delete"}:
             continue
         armature.animation_data.drivers.remove(fcurve)
         removed += 1
