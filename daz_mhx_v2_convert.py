@@ -260,6 +260,18 @@ def source_prop_refs_from_driver(armature, driver):
     return refs
 
 
+def source_shape_key_refs_from_driver(driver):
+    refs = set()
+    for variable in driver.variables:
+        for target in variable.targets:
+            shape_key_name = shape_key_name_from_data_path(
+                getattr(target, "data_path", "")
+            )
+            if shape_key_name:
+                refs.add(shape_key_name)
+    return refs
+
+
 def driver_has_bone_source(driver):
     return bool(driver_bone_sources(driver))
 
@@ -1142,6 +1154,8 @@ def delete_safe_driver_bone_transform_drivers(armature):
 def should_preserve_shape_key_driver(shape_name, trace):
     if shape_name and shape_name.startswith("pJCM"):
         return True
+    if trace.get("shape_key_sources"):
+        return True
     return trace["classification"] in {
         "dynamic_bone_driven",
         "pose_corrective_prop_driven",
@@ -1167,8 +1181,10 @@ def plan_shape_key_driver_cleanup(armature):
         for fcurve in list(shape_keys.animation_data.drivers):
             shape_name = shape_key_name_from_data_path(fcurve.data_path)
             source_props = source_prop_refs_from_driver(armature, fcurve.driver)
+            source_shape_keys = source_shape_key_refs_from_driver(fcurve.driver)
             direct_bone_sources = driver_bone_sources(fcurve.driver)
             trace = trace_prop_dependencies(source_props, trace_index)
+            trace["shape_key_sources"] = source_shape_keys
             trace_bone_sources = trace.get("bone_sources", set())
             all_bone_sources = direct_bone_sources | trace_bone_sources
             if direct_bone_sources:
@@ -1180,6 +1196,8 @@ def plan_shape_key_driver_cleanup(armature):
             }
             if source_props:
                 entry["source_props"] = sorted(source_props)
+            if source_shape_keys:
+                entry["source_shape_keys"] = sorted(source_shape_keys, key=str.lower)
             if trace["roots"]:
                 entry["root_props"] = sorted(trace["roots"], key=str.lower)
             if all_bone_sources:
