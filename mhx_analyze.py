@@ -331,6 +331,164 @@ def source_ref_summary_kind(variables):
     return "constant_or_unknown_source"
 
 
+def prop_root_category(name):
+    if name.startswith("pJCM"):
+        return "pose_corrective_prop"
+    if name.startswith(("Mha",)):
+        return "rig_setting_prop"
+    if name.startswith(("pCTRL", "CTRL")):
+        return "pose_or_body_control_prop"
+    if name.startswith(("eCTRL", "ECTRL", "eJCM")):
+        return "expression_prop"
+    if name.startswith(("facs_", "MCM")):
+        return "facs_or_combo_prop"
+    if name.startswith(("PBM", "PHM", "FBM")):
+        return "daz_morph_prop"
+    if name.endswith("(fin)") or "(rst)" in name or re.search(r":\d+$", name):
+        return "computed_intermediate_prop"
+    return "other_prop"
+
+
+def prop_driver_graph_key(scope, name):
+    return f"{scope}:{name}"
+
+
+def build_prop_driver_index(armature):
+    index = {}
+    for scope, id_block in (
+        ("object", armature),
+        ("data", armature.data),
+    ):
+        if not id_block or not id_block.animation_data:
+            continue
+
+        for fcurve in id_block.animation_data.drivers:
+            names = custom_properties_from_path(fcurve.data_path)
+            if not names:
+                continue
+
+            variables = compact_source_refs(collect_driver_source_refs(fcurve.driver))
+            index[prop_driver_graph_key(scope, names[0])] = {
+                "scope": scope,
+                "property": names[0],
+                "expression": fcurve.driver.expression,
+                "array_index": fcurve.array_index,
+                "variables": variables,
+            }
+    return index
+
+
+def trace_upstream_property(prop_name, prop_index, max_depth=8):
+    roots = []
+    drivers = []
+    visited = set()
+
+    def visit(name, depth, via_scope=None):
+        if depth > max_depth:
+            roots.append(
+                {
+                    "property": name,
+                    "category": "depth_limit",
+                    "depth": depth,
+                }
+            )
+            return
+
+        candidates = []
+        if via_scope:
+            candidates.append(prop_driver_graph_key(via_scope, name))
+        candidates.extend(
+            [
+                prop_driver_graph_key("object", name),
+                prop_driver_graph_key("data", name),
+            ]
+        )
+
+        key = next((candidate for candidate in candidates if candidate in prop_index), None)
+        if not key:
+            roots.append(
+                {
+                    "property": name,
+                    "category": prop_root_category(name),
+                    "depth": depth,
+                }
+            )
+            return
+
+        if key in visited:
+            roots.append(
+                {
+                    "property": name,
+                    "category": "cycle",
+                    "depth": depth,
+                }
+            )
+            return
+
+        visited.add(key)
+        record = prop_index[key]
+        drivers.append(
+            {
+                "scope": record["scope"],
+                "property": record["property"],
+                "expression": record["expression"],
+                "array_index": record["array_index"],
+                "depth": depth,
+                "variables": record["variables"],
+            }
+        )
+
+        for variable in record["variables"]:
+            source_prop = variable.get("property")
+            if source_prop:
+                source_scope = "data" if ".data" in variable.get("data_path", "") else None
+                visit(source_prop, depth + 1, source_scope)
+                continue
+
+            if variable.get("bone") or variable.get("transform_type"):
+                roots.append(
+                    {
+                        "property": None,
+                        "category": "bone_transform_root",
+                        "depth": depth + 1,
+                        "bone": variable.get("bone"),
+                        "data_path": variable.get("data_path"),
+                        "transform_type": variable.get("transform_type"),
+                    }
+                )
+
+    visit(prop_name, 0)
+    root_categories = sorted({root["category"] for root in roots})
+    if "bone_transform_root" in root_categories:
+        classification = "dynamic_bone_driven"
+    elif "pose_corrective_prop" in root_categories:
+        classification = "pose_corrective_prop_driven"
+    elif "rig_setting_prop" in root_categories:
+        classification = "rig_setting_driven"
+    elif root_categories and set(root_categories).issubset(
+        {
+            "expression_prop",
+            "facs_or_combo_prop",
+            "daz_morph_prop",
+            "computed_intermediate_prop",
+            "other_prop",
+        }
+    ):
+        classification = "morph_or_expression_driven"
+    else:
+        classification = "mixed_or_unknown"
+
+    return {
+        "classification": classification,
+        "root_categories": root_categories,
+        "roots": sorted(roots, key=lambda item: (item["category"], str(item.get("property")))),
+        "driver_chain": sorted(
+            drivers,
+            key=lambda item: (item["depth"], item["scope"], item["property"]),
+        ),
+    }
+
+
 def compact_driver_record(record):
     source_properties = []
     source_bones = []
@@ -897,6 +1055,8 @@ def collect_corrective_shape_key_catalog(armature):
     entries = []
     category_counts = Counter()
     source_kind_counts = Counter()
+    upstream_counts = Counter()
+    prop_index = build_prop_driver_index(armature)
     for mesh_obj in related_meshes_for_armature(armature):
         shape_keys = getattr(mesh_obj.data, "shape_keys", None)
         if not shape_keys or not shape_keys.animation_data:
@@ -913,16 +1073,44 @@ def collect_corrective_shape_key_catalog(armature):
 
             driver = compact_shape_key_driver(fcurve)
             source_kind = source_ref_summary_kind(driver["variables"])
+            upstream_traces = []
+            for variable in driver["variables"]:
+                prop_name = variable.get("property")
+                if prop_name:
+                    upstream_traces.append(
+                        {
+                            "source_property": prop_name,
+                            **trace_upstream_property(prop_name, prop_index),
+                        }
+                    )
+
+            upstream_classification = "no_property_source"
+            if upstream_traces:
+                trace_classes = {trace["classification"] for trace in upstream_traces}
+                if len(trace_classes) == 1:
+                    upstream_classification = next(iter(trace_classes))
+                elif "dynamic_bone_driven" in trace_classes:
+                    upstream_classification = "dynamic_bone_driven"
+                elif "pose_corrective_prop_driven" in trace_classes:
+                    upstream_classification = "pose_corrective_prop_driven"
+                elif "rig_setting_driven" in trace_classes:
+                    upstream_classification = "rig_setting_driven"
+                else:
+                    upstream_classification = "mixed_or_unknown"
+
             category_counts[category] += 1
             source_kind_counts[source_kind] += 1
+            upstream_counts[upstream_classification] += 1
             entries.append(
                 {
                     "mesh": mesh_obj.name,
                     "shape_key": shape_name,
                     "category": category,
                     "source_kind": source_kind,
+                    "upstream_classification": upstream_classification,
                     "expression": driver["expression"],
                     "variables": driver["variables"],
+                    "upstream": upstream_traces,
                 }
             )
 
@@ -932,6 +1120,7 @@ def collect_corrective_shape_key_catalog(armature):
             "candidate_count": len(entries),
             "category_counts": dict(category_counts),
             "source_kind_counts": dict(source_kind_counts),
+            "upstream_classification_counts": dict(upstream_counts),
         },
         "candidates": sorted(
             entries,
