@@ -275,10 +275,17 @@ def driver_has_bone_source(driver):
     return False
 
 
+def is_constant_zero_expression(expression):
+    try:
+        return abs(float(expression or "0")) <= 0.0000001
+    except Exception:
+        return False
+
+
 def prop_name_category(name):
     if name.startswith("pJCM"):
         return "pose_corrective"
-    if "pCTRL" in name:
+    if "pCTRL" in name or name.startswith("CTRL"):
         return "pose_control"
     if name.startswith("Mha"):
         return "rig_setting"
@@ -364,6 +371,33 @@ def trace_prop_dependencies(seed_props, trace_index, max_depth=16):
         "has_bone_source": has_bone_source,
         "classification": trace_classification_for_roots(roots, has_bone_source),
     }
+
+
+def transform_driver_cache_decision(armature, fcurve, pose_path, trace_index):
+    if pose_path["channel_base"] not in SAFE_CHANNELS:
+        return "not_transform_channel"
+
+    if is_constant_zero_expression(fcurve.driver.expression if fcurve.driver else ""):
+        return "constant_zero_delete"
+
+    if not fcurve.driver:
+        return "missing_driver"
+
+    if driver_has_bone_source(fcurve.driver):
+        return "dynamic_bone_source_preserve"
+
+    source_props = source_prop_refs_from_driver(armature, fcurve.driver)
+    source_names = {split_prop_key(key)[1] for key in source_props}
+    if any(name.startswith("Mha") for name in source_names):
+        return "rig_setting_preserve"
+
+    trace = trace_prop_dependencies(source_props, trace_index)
+    if trace["classification"] == "dynamic_bone_driven":
+        return "dynamic_bone_source_preserve"
+    if trace["classification"] == "rig_setting_driven":
+        return "rig_setting_preserve"
+
+    return "cacheable_transform_driver"
 
 
 def output_prop_ref_from_fcurve(armature, owner_scope, fcurve):
@@ -502,13 +536,13 @@ def driver_bones_with_transform_drivers(armature):
     if not armature.animation_data:
         return bones
 
+    trace_index = build_prop_driver_trace_index(armature)
     for fcurve in armature.animation_data.drivers:
         pose_path = parse_pose_bone_data_path(fcurve.data_path)
         if not pose_path:
             continue
-        if not pose_path["is_driver_bone"]:
-            continue
-        if pose_path["channel_base"] not in SAFE_CHANNELS:
+        decision = transform_driver_cache_decision(armature, fcurve, pose_path, trace_index)
+        if decision != "cacheable_transform_driver":
             continue
         bones.add(pose_path["bone_name"])
     return bones
@@ -517,13 +551,18 @@ def driver_bones_with_transform_drivers(armature):
 def bone_transform_source_props(armature, driver_records):
     refs = set()
     transform_drivers = []
+    trace_index = build_prop_driver_trace_index(armature)
     for record in driver_records:
         pose_path = record["pose_path"]
         if not pose_path:
             continue
-        if pose_path["channel_base"] not in SAFE_CHANNELS:
-            continue
-        if not pose_path["is_driver_bone"]:
+        decision = transform_driver_cache_decision(
+            armature,
+            record["fcurve"],
+            pose_path,
+            trace_index,
+        )
+        if decision != "cacheable_transform_driver":
             continue
 
         refs.update(record["source_props"])
@@ -561,7 +600,7 @@ def constraint_source_props(driver_records):
 
 
 def is_protected_prop_name(name):
-    return name.startswith(("Mha", "pCTRL", "pJCM"))
+    return name.startswith(("Mha", "pJCM"))
 
 
 def ancestor_props(seed_props, reverse_edges):
@@ -906,6 +945,7 @@ def compact_driver_audit_entry(armature, fcurve, pose_path, reason=None):
 
 def cleanup_cached_bone_transform_drivers(armature, cache):
     cached_bones = cached_driver_bones(cache)
+    trace_index = build_prop_driver_trace_index(armature)
     audit = {
         "armature": armature.name,
         "cached_driver_bone_count": len(cached_bones),
@@ -922,7 +962,9 @@ def cleanup_cached_bone_transform_drivers(armature, cache):
         if not pose_path:
             continue
 
-        if pose_path["channel_base"] not in SAFE_CHANNELS:
+        decision = transform_driver_cache_decision(armature, fcurve, pose_path, trace_index)
+
+        if decision == "not_transform_channel":
             audit["ignored"].append(
                 compact_driver_audit_entry(
                     armature,
@@ -933,13 +975,40 @@ def cleanup_cached_bone_transform_drivers(armature, cache):
             )
             continue
 
-        if not pose_path["is_driver_bone"]:
+        if decision in {
+            "dynamic_bone_source_preserve",
+            "rig_setting_preserve",
+            "missing_driver",
+        }:
+            audit["preserved"].append(
+                compact_driver_audit_entry(
+                    armature,
+                    fcurve,
+                    pose_path,
+                    decision,
+                )
+            )
+            continue
+
+        if decision == "constant_zero_delete":
+            audit["removed"].append(
+                compact_driver_audit_entry(
+                    armature,
+                    fcurve,
+                    pose_path,
+                    "constant_zero_delete",
+                )
+            )
+            armature.animation_data.drivers.remove(fcurve)
+            continue
+
+        if decision != "cacheable_transform_driver":
             audit["ignored"].append(
                 compact_driver_audit_entry(
                     armature,
                     fcurve,
                     pose_path,
-                    "not_driver_bone",
+                    decision,
                 )
             )
             continue
@@ -955,7 +1024,14 @@ def cleanup_cached_bone_transform_drivers(armature, cache):
             )
             continue
 
-        audit["removed"].append(compact_driver_audit_entry(armature, fcurve, pose_path))
+        audit["removed"].append(
+            compact_driver_audit_entry(
+                armature,
+                fcurve,
+                pose_path,
+                "cached_transform_driver",
+            )
+        )
         armature.animation_data.drivers.remove(fcurve)
 
     return audit
