@@ -63,6 +63,13 @@ def prop_driver_cleanup_path_for_armature(armature):
     )
 
 
+def data_prop_cleanup_path_for_armature(armature):
+    return os.path.join(
+        OUTPUT_DIR,
+        f"daz_mhx_data_prop_cleanup_{safe_filename(armature.name)}.json",
+    )
+
+
 def runtime_key_for_armature(armature, path):
     return (armature.as_pointer(), path)
 
@@ -1007,6 +1014,114 @@ def write_prop_driver_cleanup_audit(armature, audit):
     return path, summary
 
 
+def compact_data_prop_driver_entry(armature, fcurve, name, reason=None):
+    entry = {
+        "property": name,
+        "array_index": fcurve.array_index,
+    }
+    if fcurve.driver:
+        expression = fcurve.driver.expression
+        if expression:
+            entry["expression"] = expression
+        source_props = sorted(source_prop_refs_from_driver(armature, fcurve.driver))
+        if source_props:
+            entry["source_props"] = source_props
+    if reason:
+        entry["reason"] = reason
+    return entry
+
+
+def cleanup_driven_data_props(armature):
+    audit = {
+        "armature": armature.name,
+        "removed": [],
+        "preserved": [],
+        "ignored": [],
+        "deleted_props": [],
+    }
+    data = armature.data
+    if not data or not data.animation_data:
+        return audit
+
+    props_to_delete = set()
+    for fcurve in list(data.animation_data.drivers):
+        names = custom_properties_from_path(fcurve.data_path)
+        if not names:
+            audit["ignored"].append(
+                compact_data_prop_driver_entry(
+                    armature,
+                    fcurve,
+                    None,
+                    "not_custom_property_output",
+                )
+            )
+            continue
+
+        name = names[0]
+        if "pCTRL" in name:
+            audit["preserved"].append(
+                compact_data_prop_driver_entry(
+                    armature,
+                    fcurve,
+                    name,
+                    "pCTRL",
+                )
+            )
+            continue
+
+        audit["removed"].append(compact_data_prop_driver_entry(armature, fcurve, name))
+        data.animation_data.drivers.remove(fcurve)
+        props_to_delete.add(name)
+
+    for name in sorted(props_to_delete, key=str.lower):
+        if name not in data:
+            continue
+        try:
+            del data[name]
+            audit["deleted_props"].append(name)
+        except Exception:
+            audit["ignored"].append(
+                {
+                    "property": name,
+                    "reason": "delete_failed",
+                }
+            )
+
+    return audit
+
+
+def write_data_prop_cleanup_audit(armature, audit):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    path = data_prop_cleanup_path_for_armature(armature)
+    summary = {
+        "removed_driver_count": len(audit["removed"]),
+        "deleted_prop_count": len(audit["deleted_props"]),
+        "preserved_driver_count": len(audit["preserved"]),
+        "ignored_driver_count": len(audit["ignored"]),
+    }
+    payload = {
+        "schema_version": 1,
+        "armature": audit["armature"],
+        "summary": summary,
+        "deleted_props": audit["deleted_props"],
+        "removed": sorted(
+            audit["removed"],
+            key=lambda item: item.get("property") or "",
+        ),
+        "preserved": sorted(
+            audit["preserved"],
+            key=lambda item: item.get("property") or "",
+        ),
+        "ignored": sorted(
+            audit["ignored"],
+            key=lambda item: (item.get("reason") or "", item.get("property") or ""),
+        ),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    return path, summary
+
+
 def delete_and_rebuild_props(armature, cache, classification):
     removed_prop_drivers = 0
     deleted_props = 0
@@ -1032,7 +1147,7 @@ def delete_and_rebuild_props(armature, cache, classification):
             pass
 
     for key, morph in sorted(rebuild_controls.items()):
-        id_block = id_block_for_scope(armature, morph["scope"])
+        id_block = armature
         default = morph.get("default", 0.0)
         id_block[morph["name"]] = default if numeric_scalar(default) else 0.0
         update_property_ui(id_block, morph["name"], morph.get("ui", {}))
@@ -1148,6 +1263,8 @@ def runtime_cache_for_armature(armature, force_reload=False):
         scope = morph.get("scope")
         name = morph.get("name")
         id_block = id_block_for_scope(armature, scope)
+        if scope == "data" and (not id_block or name not in id_block) and name in armature:
+            id_block = armature
         if not id_block or name not in id_block:
             continue
 
@@ -1493,6 +1610,41 @@ class DAZMHX_OT_v2_delete_cached_prop_drivers(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class DAZMHX_OT_v2_delete_driven_data_props(bpy.types.Operator):
+    bl_idname = "daz_mhx.v2_delete_driven_data_props"
+    bl_label = "Delete Driven Data Props"
+    bl_description = "Delete every armature-data custom property that has a driver, except properties containing pCTRL"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        armature = selected_armature(context)
+        if not armature:
+            self.report({"WARNING"}, "Select an armature.")
+            return {"CANCELLED"}
+
+        audit = cleanup_driven_data_props(armature)
+        audit_path, summary = write_data_prop_cleanup_audit(armature, audit)
+        armature["daz_mhx_v2_data_prop_cleanup_path"] = audit_path
+        armature["daz_mhx_v2_removed_data_prop_drivers"] = summary["removed_driver_count"]
+        armature["daz_mhx_v2_deleted_data_props"] = summary["deleted_prop_count"]
+        armature["daz_mhx_v2_preserved_data_prop_drivers"] = summary["preserved_driver_count"]
+
+        armature["daz_mhx_v2_status"] = (
+            f"Deleted {summary['deleted_prop_count']} driven data props; "
+            f"removed {summary['removed_driver_count']} data prop drivers, "
+            f"preserved {summary['preserved_driver_count']} pCTRL drivers. "
+            f"Audit: {os.path.basename(audit_path)}"
+        )
+        self.report(
+            {"INFO"},
+            (
+                f"Deleted {summary['deleted_prop_count']} driven data props. "
+                f"Wrote {audit_path}."
+            ),
+        )
+        return {"FINISHED"}
+
+
 class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
     bl_idname = "daz_mhx.v2_delete_originals"
     bl_label = "Delete Converted Drivers/Props"
@@ -1523,6 +1675,11 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
             armature,
             prop_audit,
         )
+        data_prop_audit = cleanup_driven_data_props(armature)
+        data_prop_audit_path, data_prop_summary = write_data_prop_cleanup_audit(
+            armature,
+            data_prop_audit,
+        )
         removed_shape_key_drivers = delete_shape_key_drivers(armature)
         removed_prop_drivers, deleted_props, rebuilt_props = delete_and_rebuild_props(
             armature,
@@ -1530,6 +1687,8 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
             classification,
         )
         removed_prop_drivers += prop_audit_summary["removed_driver_count"]
+        removed_prop_drivers += data_prop_summary["removed_driver_count"]
+        deleted_props += data_prop_summary["deleted_prop_count"]
 
         armature["daz_mhx_v2_cache_path"] = cache_path
         armature["daz_mhx_v2_cache_id"] = armature.name
@@ -1542,6 +1701,10 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
         armature["daz_mhx_v2_preserved_prop_drivers"] = prop_audit_summary["preserved_driver_count"]
         armature["daz_mhx_v2_ignored_prop_drivers"] = prop_audit_summary["ignored_driver_count"]
         armature["daz_mhx_v2_prop_driver_cleanup_path"] = prop_audit_path
+        armature["daz_mhx_v2_data_prop_cleanup_path"] = data_prop_audit_path
+        armature["daz_mhx_v2_removed_data_prop_drivers"] = data_prop_summary["removed_driver_count"]
+        armature["daz_mhx_v2_deleted_data_props"] = data_prop_summary["deleted_prop_count"]
+        armature["daz_mhx_v2_preserved_data_prop_drivers"] = data_prop_summary["preserved_driver_count"]
         armature["daz_mhx_v2_deleted_props"] = deleted_props
         armature["daz_mhx_v2_rebuilt_props"] = rebuilt_props
 
@@ -1558,7 +1721,8 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
             f"{removed_shape_key_drivers} shape-key drivers and "
             f"{removed_prop_drivers} custom-property drivers. "
             f"Bone audit: {os.path.basename(audit_path)}; "
-            f"prop audit: {os.path.basename(prop_audit_path)}"
+            f"prop audit: {os.path.basename(prop_audit_path)}; "
+            f"data audit: {os.path.basename(data_prop_audit_path)}"
         )
         self.report(
             {"INFO"},
@@ -1627,6 +1791,7 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
         layout.operator("daz_mhx.v2_write_cache")
         layout.operator("daz_mhx.v2_delete_cached_bone_drivers")
         layout.operator("daz_mhx.v2_delete_cached_prop_drivers")
+        layout.operator("daz_mhx.v2_delete_driven_data_props")
         layout.operator("daz_mhx.v2_delete_originals")
         layout.operator("daz_mhx.v2_load_runtime")
         layout.operator("daz_mhx.v2_apply_current")
@@ -1662,6 +1827,7 @@ classes = (
     DAZMHX_OT_v2_write_cache,
     DAZMHX_OT_v2_delete_cached_bone_drivers,
     DAZMHX_OT_v2_delete_cached_prop_drivers,
+    DAZMHX_OT_v2_delete_driven_data_props,
     DAZMHX_OT_v2_delete_originals,
     DAZMHX_OT_v2_load_runtime,
     DAZMHX_OT_v2_apply_current,
