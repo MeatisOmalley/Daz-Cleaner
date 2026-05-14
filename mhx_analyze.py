@@ -22,6 +22,8 @@ OUTPUT_DIR = r"C:\Users\meat\Documents\blender\code\Daz Cleaner"
 DEFAULT_OUTPUT_FILENAME = "mhx_analysis.json"
 DEFAULT_BONE_DRIVER_OUTPUT_FILENAME = "mhx_bone_drivers.json"
 DEFAULT_SHAPE_KEY_OUTPUT_FILENAME = "mhx_shape_keys.json"
+DEFAULT_CORRECTIVE_SHAPE_OUTPUT_FILENAME = "mhx_corrective_shape_keys.json"
+DEFAULT_BONE_DRIVER_CATALOG_OUTPUT_FILENAME = "mhx_bone_driver_catalog.json"
 
 POSE_BONE_PATH_RE = re.compile(r'pose\.bones\["([^"]+)"\]\.(.+)')
 CUSTOM_PROPERTY_PATH_RE = re.compile(r'\["([^"]+)"\]')
@@ -294,6 +296,39 @@ def shape_key_name_category(name):
     if re.match(r"^[lr][A-Z]", name):
         return "side_named"
     return "other"
+
+
+def shape_key_corrective_category(name):
+    lower = name.lower()
+    if name.startswith("pJCM"):
+        return "pose_joint_corrective"
+    if name.startswith("eJCM"):
+        return "expression_corrective"
+    if name.startswith("MCM"):
+        return "morph_combo_corrective"
+    if name.startswith("facs_cbs"):
+        return "facs_combo_corrective"
+    if name.startswith("facs_bs"):
+        return "facs_base_shape"
+    if "jcm" in lower:
+        return "joint_corrective_other"
+    if "cbs" in lower or "_x" in name:
+        return "combo_corrective_candidate"
+    if "corrective" in lower or lower.startswith(("fix", "adj")):
+        return "named_corrective"
+    return "not_obvious_corrective"
+
+
+def source_ref_summary_kind(variables):
+    has_bone = any(variable.get("bone") or variable.get("transform_type") for variable in variables)
+    has_prop = any(variable.get("property") for variable in variables)
+    if has_bone and has_prop:
+        return "mixed_bone_and_property"
+    if has_bone:
+        return "bone_transform_source"
+    if has_prop:
+        return "custom_property_source"
+    return "constant_or_unknown_source"
 
 
 def compact_driver_record(record):
@@ -858,6 +893,130 @@ def collect_compact_shape_key_report(armature):
     }
 
 
+def collect_corrective_shape_key_catalog(armature):
+    entries = []
+    category_counts = Counter()
+    source_kind_counts = Counter()
+    for mesh_obj in related_meshes_for_armature(armature):
+        shape_keys = getattr(mesh_obj.data, "shape_keys", None)
+        if not shape_keys or not shape_keys.animation_data:
+            continue
+
+        for fcurve in shape_keys.animation_data.drivers:
+            shape_name = shape_key_name_from_data_path(fcurve.data_path)
+            if not shape_name:
+                continue
+
+            category = shape_key_corrective_category(shape_name)
+            if category == "not_obvious_corrective":
+                continue
+
+            driver = compact_shape_key_driver(fcurve)
+            source_kind = source_ref_summary_kind(driver["variables"])
+            category_counts[category] += 1
+            source_kind_counts[source_kind] += 1
+            entries.append(
+                {
+                    "mesh": mesh_obj.name,
+                    "shape_key": shape_name,
+                    "category": category,
+                    "source_kind": source_kind,
+                    "expression": driver["expression"],
+                    "variables": driver["variables"],
+                }
+            )
+
+    return {
+        "armature": armature.name,
+        "summary": {
+            "candidate_count": len(entries),
+            "category_counts": dict(category_counts),
+            "source_kind_counts": dict(source_kind_counts),
+        },
+        "candidates": sorted(
+            entries,
+            key=lambda item: (
+                item["category"],
+                item["mesh"].lower(),
+                item["shape_key"].lower(),
+            ),
+        ),
+    }
+
+
+def collect_bone_driver_cacheability_catalog(armature):
+    entries = []
+    channel_counts = Counter()
+    source_kind_counts = Counter()
+    decision_counts = Counter()
+    for owner_label, id_block in (
+        ("object", armature),
+        ("data", armature.data),
+    ):
+        if not id_block or not id_block.animation_data:
+            continue
+
+        for fcurve in id_block.animation_data.drivers:
+            pose_path = parse_pose_bone_data_path(fcurve.data_path)
+            if not pose_path:
+                continue
+
+            variables = compact_source_refs(collect_driver_source_refs(fcurve.driver))
+            source_kind = source_ref_summary_kind(variables)
+            channel = pose_path["channel_base"]
+            is_transform = channel in {"location", "rotation_euler", "rotation_quaternion", "scale"}
+            is_constraint = channel == "constraints"
+            props = sorted({variable.get("property") for variable in variables if variable.get("property")})
+            protected_props = [prop for prop in props if prop.startswith(("Mha", "pCTRL", "pJCM"))]
+
+            if source_kind in {"bone_transform_source", "mixed_bone_and_property"}:
+                decision = "dynamic_bone_source_keep_driver"
+            elif is_transform and pose_path["is_driver_bone"]:
+                decision = "cacheable_driver_bone_transform"
+            elif is_constraint and protected_props:
+                decision = "rig_setting_callback_candidate"
+            elif is_constraint:
+                decision = "constraint_callback_candidate"
+            else:
+                decision = "needs_review"
+
+            channel_counts[channel] += 1
+            source_kind_counts[source_kind] += 1
+            decision_counts[decision] += 1
+            entries.append(
+                {
+                    "bone": pose_path["bone_name"],
+                    "owner": owner_label,
+                    "channel": channel,
+                    "array_index": fcurve.array_index,
+                    "expression": fcurve.driver.expression,
+                    "source_kind": source_kind,
+                    "decision": decision,
+                    "properties": props,
+                    "variables": variables,
+                }
+            )
+
+    return {
+        "armature": armature.name,
+        "summary": {
+            "driver_count": len(entries),
+            "channel_counts": dict(channel_counts),
+            "source_kind_counts": dict(source_kind_counts),
+            "decision_counts": dict(decision_counts),
+        },
+        "drivers": sorted(
+            entries,
+            key=lambda item: (
+                item["decision"],
+                item["bone"].lower(),
+                item["channel"],
+                item["array_index"],
+            ),
+        ),
+    }
+
+
 def collect_bone_data(armature):
     bones = []
     data_bones = armature.data.bones if armature.data else {}
@@ -1057,6 +1216,32 @@ def build_shape_key_report(context):
     }
 
 
+def build_corrective_shape_key_report(context):
+    armatures = selected_armatures(context)
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "blend_file": bpy.data.filepath,
+        "selected_armatures": [
+            collect_corrective_shape_key_catalog(armature)
+            for armature in armatures
+        ],
+    }
+
+
+def build_bone_driver_catalog_report(context):
+    armatures = selected_armatures(context)
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "blend_file": bpy.data.filepath,
+        "selected_armatures": [
+            collect_bone_driver_cacheability_catalog(armature)
+            for armature in armatures
+        ],
+    }
+
+
 def default_output_path():
     return os.path.join(OUTPUT_DIR, DEFAULT_OUTPUT_FILENAME)
 
@@ -1067,6 +1252,14 @@ def default_bone_driver_output_path():
 
 def default_shape_key_output_path():
     return os.path.join(OUTPUT_DIR, DEFAULT_SHAPE_KEY_OUTPUT_FILENAME)
+
+
+def default_corrective_shape_key_output_path():
+    return os.path.join(OUTPUT_DIR, DEFAULT_CORRECTIVE_SHAPE_OUTPUT_FILENAME)
+
+
+def default_bone_driver_catalog_output_path():
+    return os.path.join(OUTPUT_DIR, DEFAULT_BONE_DRIVER_CATALOG_OUTPUT_FILENAME)
 
 
 class MHX_OT_export_analysis_json(bpy.types.Operator):
@@ -1156,6 +1349,64 @@ class MHX_OT_export_shape_keys_json(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class MHX_OT_export_corrective_shape_keys_json(bpy.types.Operator):
+    bl_idname = "mhx.export_corrective_shape_keys_json"
+    bl_label = "Export Corrective Shape Keys JSON"
+    bl_description = "Export sparse corrective-looking shape keys and their driver sources"
+    bl_options = {"REGISTER"}
+
+    output_path: bpy.props.StringProperty(
+        name="Output Path",
+        subtype="FILE_PATH",
+        default=default_corrective_shape_key_output_path(),
+    )
+
+    def execute(self, context):
+        if not selected_armatures(context):
+            self.report({"WARNING"}, "Select at least one armature.")
+            return {"CANCELLED"}
+
+        path = bpy.path.abspath(self.output_path)
+        output_dir = os.path.dirname(path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(build_corrective_shape_key_report(context), handle, indent=2, sort_keys=True)
+
+        self.report({"INFO"}, f"Wrote corrective shape key JSON: {path}")
+        return {"FINISHED"}
+
+
+class MHX_OT_export_bone_driver_catalog_json(bpy.types.Operator):
+    bl_idname = "mhx.export_bone_driver_catalog_json"
+    bl_label = "Export Bone Driver Catalog JSON"
+    bl_description = "Export sparse bone drivers classified by likely cacheability/dynamic behavior"
+    bl_options = {"REGISTER"}
+
+    output_path: bpy.props.StringProperty(
+        name="Output Path",
+        subtype="FILE_PATH",
+        default=default_bone_driver_catalog_output_path(),
+    )
+
+    def execute(self, context):
+        if not selected_armatures(context):
+            self.report({"WARNING"}, "Select at least one armature.")
+            return {"CANCELLED"}
+
+        path = bpy.path.abspath(self.output_path)
+        output_dir = os.path.dirname(path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(build_bone_driver_catalog_report(context), handle, indent=2, sort_keys=True)
+
+        self.report({"INFO"}, f"Wrote bone driver catalog JSON: {path}")
+        return {"FINISHED"}
+
+
 class MHX_PT_rig_analyzer(bpy.types.Panel):
     bl_label = "MHX Rig Analyzer"
     bl_idname = "MHX_PT_rig_analyzer"
@@ -1171,12 +1422,16 @@ class MHX_PT_rig_analyzer(bpy.types.Panel):
         layout.operator("mhx.export_analysis_json", text="Export Analysis JSON")
         layout.operator("mhx.export_bone_drivers_json", text="Export Bone Drivers JSON")
         layout.operator("mhx.export_shape_keys_json", text="Export Shape Keys JSON")
+        layout.operator("mhx.export_corrective_shape_keys_json", text="Export Corrective Shape Keys JSON")
+        layout.operator("mhx.export_bone_driver_catalog_json", text="Export Bone Driver Catalog JSON")
 
 
 classes = (
     MHX_OT_export_analysis_json,
     MHX_OT_export_bone_drivers_json,
     MHX_OT_export_shape_keys_json,
+    MHX_OT_export_corrective_shape_keys_json,
+    MHX_OT_export_bone_driver_catalog_json,
     MHX_PT_rig_analyzer,
 )
 

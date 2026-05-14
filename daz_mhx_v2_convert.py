@@ -19,7 +19,6 @@ bl_info = {
 }
 
 
-OUTPUT_DIR = r"C:\Users\meat\Documents\blender\code\Daz Cleaner"
 POSE_BONE_PATH_RE = re.compile(r'pose\.bones\["([^"]+)"\]\.(.+)')
 CUSTOM_PROPERTY_PATH_RE = re.compile(r'\["([^"]+)"\]')
 SAFE_CHANNELS = {"location", "rotation_euler", "rotation_quaternion", "scale"}
@@ -57,30 +56,47 @@ def safe_filename(name):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "Armature"
 
 
+def blend_output_dir():
+    if bpy.data.filepath:
+        return os.path.dirname(bpy.data.filepath)
+    return bpy.path.abspath("//")
+
+
+def blend_relative_path(path):
+    try:
+        return bpy.path.relpath(path)
+    except ValueError:
+        return path
+
+
+def resolve_blend_path(path):
+    return bpy.path.abspath(path) if path else path
+
+
 def cache_path_for_armature(armature):
     return os.path.join(
-        OUTPUT_DIR,
-        f"daz_mhx_morph_cache_{safe_filename(armature.name)}.json",
+        blend_output_dir(),
+        f"morph_cache_{safe_filename(armature.name)}.json",
     )
 
 
 def bone_driver_cleanup_path_for_armature(armature):
     return os.path.join(
-        OUTPUT_DIR,
+        blend_output_dir(),
         f"daz_mhx_bone_driver_cleanup_{safe_filename(armature.name)}.json",
     )
 
 
 def prop_driver_cleanup_path_for_armature(armature):
     return os.path.join(
-        OUTPUT_DIR,
+        blend_output_dir(),
         f"daz_mhx_prop_driver_cleanup_{safe_filename(armature.name)}.json",
     )
 
 
 def data_prop_cleanup_path_for_armature(armature):
     return os.path.join(
-        OUTPUT_DIR,
+        blend_output_dir(),
         f"daz_mhx_data_prop_cleanup_{safe_filename(armature.name)}.json",
     )
 
@@ -840,8 +856,8 @@ def cleanup_cached_bone_transform_drivers(armature, cache):
 
 
 def write_bone_driver_cleanup_audit(armature, audit):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = bone_driver_cleanup_path_for_armature(armature)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     summary = {
         "removed_driver_count": len(audit["removed"]),
         "preserved_driver_count": len(audit["preserved"]),
@@ -1008,8 +1024,8 @@ def cleanup_cached_prop_drivers(armature, cache, classification):
 
 
 def write_prop_driver_cleanup_audit(armature, audit):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = prop_driver_cleanup_path_for_armature(armature)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     summary = {
         "removed_driver_count": len(audit["removed"]),
         "preserved_driver_count": len(audit["preserved"]),
@@ -1114,8 +1130,8 @@ def cleanup_driven_data_props(armature):
 
 
 def write_data_prop_cleanup_audit(armature, audit):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     path = data_prop_cleanup_path_for_armature(armature)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     summary = {
         "removed_driver_count": len(audit["removed"]),
         "deleted_prop_count": len(audit["deleted_props"]),
@@ -1193,17 +1209,19 @@ def make_cache(context, armature):
 
 
 def write_cache_file(armature, cache):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
     cache_path = cache_path_for_armature(armature)
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
     with open(cache_path, "w", encoding="utf-8") as handle:
         json.dump(cache, handle, indent=2, sort_keys=True)
-    armature["daz_mhx_v2_cache_path"] = cache_path
+    armature["daz_mhx_v2_cache_path"] = blend_relative_path(cache_path)
     armature["daz_mhx_v2_cache_id"] = armature.name
     return cache_path
 
 
 def load_cache_file(armature):
-    cache_path = armature.get("daz_mhx_v2_cache_path", cache_path_for_armature(armature))
+    cache_path = resolve_blend_path(
+        armature.get("daz_mhx_v2_cache_path", blend_relative_path(cache_path_for_armature(armature)))
+    )
     if not os.path.exists(cache_path):
         return None, cache_path
     with open(cache_path, "r", encoding="utf-8") as handle:
@@ -1242,7 +1260,9 @@ def shape_delta(neutral_snapshot, posed_snapshot):
 
 
 def runtime_cache_for_armature(armature, force_reload=False):
-    path = armature.get("daz_mhx_v2_cache_path", cache_path_for_armature(armature))
+    path = resolve_blend_path(
+        armature.get("daz_mhx_v2_cache_path", blend_relative_path(cache_path_for_armature(armature)))
+    )
     modified_time = os.path.getmtime(path) if os.path.exists(path) else None
     cache_key = runtime_key_for_armature(armature, path)
     existing = _RUNTIME_CACHES.get(cache_key)
@@ -1626,7 +1646,7 @@ class DAZMHX_OT_v2_delete_cached_bone_drivers(bpy.types.Operator):
         audit = cleanup_cached_bone_transform_drivers(armature, cache)
         audit_path, summary = write_bone_driver_cleanup_audit(armature, audit)
         armature["daz_mhx_v2_cache_path"] = cache_path
-        armature["daz_mhx_v2_bone_driver_cleanup_path"] = audit_path
+        armature["daz_mhx_v2_bone_driver_cleanup_path"] = blend_relative_path(audit_path)
         armature["daz_mhx_v2_removed_transform_drivers"] = summary["removed_driver_count"]
         armature["daz_mhx_v2_preserved_transform_drivers"] = summary["preserved_driver_count"]
         armature["daz_mhx_v2_ignored_transform_drivers"] = summary["ignored_driver_count"]
@@ -1674,7 +1694,7 @@ class DAZMHX_OT_v2_delete_cached_prop_drivers(bpy.types.Operator):
         audit, _deleted_record_ids = cleanup_cached_prop_drivers(armature, cache, classification)
         audit_path, summary = write_prop_driver_cleanup_audit(armature, audit)
         armature["daz_mhx_v2_cache_path"] = cache_path
-        armature["daz_mhx_v2_prop_driver_cleanup_path"] = audit_path
+        armature["daz_mhx_v2_prop_driver_cleanup_path"] = blend_relative_path(audit_path)
         armature["daz_mhx_v2_removed_prop_drivers"] = summary["removed_driver_count"]
         armature["daz_mhx_v2_preserved_prop_drivers"] = summary["preserved_driver_count"]
         armature["daz_mhx_v2_ignored_prop_drivers"] = summary["ignored_driver_count"]
@@ -1708,7 +1728,7 @@ class DAZMHX_OT_v2_delete_driven_data_props(bpy.types.Operator):
 
         audit = cleanup_driven_data_props(armature)
         audit_path, summary = write_data_prop_cleanup_audit(armature, audit)
-        armature["daz_mhx_v2_data_prop_cleanup_path"] = audit_path
+        armature["daz_mhx_v2_data_prop_cleanup_path"] = blend_relative_path(audit_path)
         armature["daz_mhx_v2_removed_data_prop_drivers"] = summary["removed_driver_count"]
         armature["daz_mhx_v2_deleted_data_props"] = summary["deleted_prop_count"]
         armature["daz_mhx_v2_preserved_data_prop_drivers"] = summary["preserved_driver_count"]
@@ -1776,13 +1796,13 @@ class DAZMHX_OT_v2_write_cache_and_clean(bpy.types.Operator):
         armature["daz_mhx_v2_removed_transform_drivers"] = removed_transform_drivers
         armature["daz_mhx_v2_preserved_transform_drivers"] = audit_summary["preserved_driver_count"]
         armature["daz_mhx_v2_ignored_transform_drivers"] = audit_summary["ignored_driver_count"]
-        armature["daz_mhx_v2_bone_driver_cleanup_path"] = audit_path
+        armature["daz_mhx_v2_bone_driver_cleanup_path"] = blend_relative_path(audit_path)
         armature["daz_mhx_v2_removed_shape_key_drivers"] = removed_shape_key_drivers
         armature["daz_mhx_v2_removed_prop_drivers"] = removed_prop_drivers
         armature["daz_mhx_v2_preserved_prop_drivers"] = prop_audit_summary["preserved_driver_count"]
         armature["daz_mhx_v2_ignored_prop_drivers"] = prop_audit_summary["ignored_driver_count"]
-        armature["daz_mhx_v2_prop_driver_cleanup_path"] = prop_audit_path
-        armature["daz_mhx_v2_data_prop_cleanup_path"] = data_prop_audit_path
+        armature["daz_mhx_v2_prop_driver_cleanup_path"] = blend_relative_path(prop_audit_path)
+        armature["daz_mhx_v2_data_prop_cleanup_path"] = blend_relative_path(data_prop_audit_path)
         armature["daz_mhx_v2_removed_data_prop_drivers"] = data_prop_summary["removed_driver_count"]
         armature["daz_mhx_v2_deleted_data_props"] = data_prop_summary["deleted_prop_count"]
         armature["daz_mhx_v2_preserved_data_prop_drivers"] = data_prop_summary["preserved_driver_count"]
@@ -1830,7 +1850,7 @@ class DAZMHX_OT_v2_load_runtime(bpy.types.Operator):
 
         armature["daz_mhx_v2_cache_path"] = armature.get(
             "daz_mhx_v2_cache_path",
-            cache_path_for_armature(armature),
+            blend_relative_path(cache_path_for_armature(armature)),
         )
         applied, active = load_or_apply_runtime(
             armature,
