@@ -1493,6 +1493,35 @@ def load_or_apply_runtime(armature, force_reload=False, force_apply=False):
     )
 
 
+def reset_runtime_controls(armature):
+    runtime = runtime_cache_for_armature(armature)
+    if not runtime:
+        armature["daz_mhx_v2_status"] = "No V2 cache found for this armature."
+        return 0, 0
+
+    global _SUPPRESS_RNA_UPDATE
+    _SUPPRESS_RNA_UPDATE = True
+    try:
+        reset_count = 0
+        for morph in runtime.get("morphs", []):
+            default = morph.get("default", 0.0)
+            if not numeric_scalar(default):
+                default = 0.0
+            value = float(default)
+            morph["id_block"][morph["name"]] = value
+            prop_name = morph.get("rna_prop_name")
+            if prop_name and hasattr(armature, prop_name):
+                setattr(armature, prop_name, value)
+            morph["last_value"] = None
+            reset_count += 1
+    finally:
+        _SUPPRESS_RNA_UPDATE = False
+
+    applied, _active = apply_runtime_cache(armature, runtime, force=True)
+    armature["daz_mhx_v2_status"] = f"Reset {reset_count} converted morphs to defaults."
+    return applied, reset_count
+
+
 class DAZMHX_OT_v2_write_cache(bpy.types.Operator):
     bl_idname = "daz_mhx.v2_write_cache"
     bl_label = "Write Morph Cache"
@@ -1645,10 +1674,10 @@ class DAZMHX_OT_v2_delete_driven_data_props(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
-    bl_idname = "daz_mhx.v2_delete_originals"
-    bl_label = "Delete Converted Drivers/Props"
-    bl_description = "Delete drivers and custom props related to the existing V2 morph cache, then rebuild the cached controls"
+class DAZMHX_OT_v2_write_cache_and_clean(bpy.types.Operator):
+    bl_idname = "daz_mhx.v2_write_cache_and_clean"
+    bl_label = "Write Cache and Clean Rig"
+    bl_description = "Write a fresh V2 morph cache, delete converted drivers and props, then rebuild cached controls"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1657,11 +1686,8 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
             self.report({"WARNING"}, "Select an armature.")
             return {"CANCELLED"}
 
-        cache, cache_path = load_cache_file(armature)
-        if not cache:
-            self.report({"WARNING"}, f"No V2 cache found at {cache_path}. Write the cache first.")
-            return {"CANCELLED"}
-
+        cache, classification = make_cache(context, armature)
+        cache_path = write_cache_file(armature, cache)
         classification = build_classification(armature)
         audit = cleanup_cached_bone_transform_drivers(armature, cache)
         audit_path, audit_summary = write_bone_driver_cleanup_audit(armature, audit)
@@ -1716,7 +1742,7 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
         )
 
         armature["daz_mhx_v2_status"] = (
-            f"Deleted/rebuilt {rebuilt_props} cached controls; removed "
+            f"Wrote cache and rebuilt {rebuilt_props} cached controls; removed "
             f"{removed_transform_drivers} transform drivers and "
             f"{removed_shape_key_drivers} shape-key drivers and "
             f"{removed_prop_drivers} custom-property drivers. "
@@ -1727,7 +1753,7 @@ class DAZMHX_OT_v2_delete_originals(bpy.types.Operator):
         self.report(
             {"INFO"},
             (
-                f"Deleted/rebuilt {rebuilt_props} controls; removed "
+                f"Wrote cache and rebuilt {rebuilt_props} controls; removed "
                 f"{removed_transform_drivers} transform drivers and "
                 f"{removed_shape_key_drivers} shape-key drivers."
             ),
@@ -1760,10 +1786,10 @@ class DAZMHX_OT_v2_load_runtime(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class DAZMHX_OT_v2_apply_current(bpy.types.Operator):
-    bl_idname = "daz_mhx.v2_apply_current"
-    bl_label = "Apply Current Morphs"
-    bl_description = "Force-apply the current cached morph values once"
+class DAZMHX_OT_v2_reset_all(bpy.types.Operator):
+    bl_idname = "daz_mhx.v2_reset_all"
+    bl_label = "Reset All"
+    bl_description = "Reset all rebuilt V2 morph controls to their default values"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1772,8 +1798,8 @@ class DAZMHX_OT_v2_apply_current(bpy.types.Operator):
             self.report({"WARNING"}, "Select an armature.")
             return {"CANCELLED"}
 
-        applied, active = load_or_apply_runtime(armature, force_apply=True)
-        self.report({"INFO"}, f"Applied {active} active morphs to {applied} bones.")
+        applied, reset_count = reset_runtime_controls(armature)
+        self.report({"INFO"}, f"Reset {reset_count} morphs; applied defaults to {applied} bones.")
         return {"FINISHED"}
 
 
@@ -1788,13 +1814,8 @@ class DAZMHX_PT_v2_converter(bpy.types.Panel):
         layout = self.layout
         armature = selected_armature(context)
 
-        layout.operator("daz_mhx.v2_write_cache")
-        layout.operator("daz_mhx.v2_delete_cached_bone_drivers")
-        layout.operator("daz_mhx.v2_delete_cached_prop_drivers")
-        layout.operator("daz_mhx.v2_delete_driven_data_props")
-        layout.operator("daz_mhx.v2_delete_originals")
-        layout.operator("daz_mhx.v2_load_runtime")
-        layout.operator("daz_mhx.v2_apply_current")
+        layout.operator("daz_mhx.v2_write_cache_and_clean")
+        layout.operator("daz_mhx.v2_reset_all")
         if armature:
             layout.label(text=armature.get("daz_mhx_v2_status", "No V2 cache loaded."))
             layout.label(text=f"Cache: {os.path.basename(cache_path_for_armature(armature))}")
@@ -1828,9 +1849,9 @@ classes = (
     DAZMHX_OT_v2_delete_cached_bone_drivers,
     DAZMHX_OT_v2_delete_cached_prop_drivers,
     DAZMHX_OT_v2_delete_driven_data_props,
-    DAZMHX_OT_v2_delete_originals,
+    DAZMHX_OT_v2_write_cache_and_clean,
     DAZMHX_OT_v2_load_runtime,
-    DAZMHX_OT_v2_apply_current,
+    DAZMHX_OT_v2_reset_all,
     DAZMHX_PT_v2_converter,
 )
 
