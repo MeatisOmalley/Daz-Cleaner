@@ -336,7 +336,7 @@ def prop_root_category(name):
         return "pose_corrective_prop"
     if name.startswith(("Mha",)):
         return "rig_setting_prop"
-    if name.startswith(("pCTRL", "CTRL")):
+    if "pCTRL" in name or name.startswith("CTRL"):
         return "pose_or_body_control_prop"
     if name.startswith(("eCTRL", "ECTRL", "eJCM")):
         return "expression_prop"
@@ -351,6 +351,16 @@ def prop_root_category(name):
 
 def prop_driver_graph_key(scope, name):
     return f"{scope}:{name}"
+
+
+def scope_from_id_ref(id_ref):
+    if not id_ref:
+        return None
+    if id_ref.get("type") == "Object":
+        return "object"
+    if id_ref.get("type") == "Armature":
+        return "data"
+    return None
 
 
 def build_prop_driver_index(armature):
@@ -378,7 +388,7 @@ def build_prop_driver_index(armature):
     return index
 
 
-def trace_upstream_property(prop_name, prop_index, max_depth=8):
+def trace_upstream_property(prop_name, prop_index, max_depth=8, prop_scope=None):
     roots = []
     drivers = []
     visited = set()
@@ -441,7 +451,7 @@ def trace_upstream_property(prop_name, prop_index, max_depth=8):
         for variable in record["variables"]:
             source_prop = variable.get("property")
             if source_prop:
-                source_scope = "data" if ".data" in variable.get("data_path", "") else None
+                source_scope = variable.get("scope")
                 visit(source_prop, depth + 1, source_scope)
                 continue
 
@@ -457,7 +467,7 @@ def trace_upstream_property(prop_name, prop_index, max_depth=8):
                     }
                 )
 
-    visit(prop_name, 0)
+    visit(prop_name, 0, prop_scope)
     root_categories = sorted({root["category"] for root in roots})
     if "bone_transform_root" in root_categories:
         classification = "dynamic_bone_driven"
@@ -487,6 +497,37 @@ def trace_upstream_property(prop_name, prop_index, max_depth=8):
             key=lambda item: (item["depth"], item["scope"], item["property"]),
         ),
     }
+
+
+def compact_upstream_trace(prop_name, prop_index, prop_scope=None):
+    trace = trace_upstream_property(prop_name, prop_index, prop_scope=prop_scope)
+    root_props = sorted(
+        {
+            root["property"]
+            for root in trace["roots"]
+            if root.get("property")
+        },
+        key=str.lower,
+    )
+    bone_roots = [
+        {
+            "bone": root.get("bone"),
+            "data_path": root.get("data_path"),
+            "transform_type": root.get("transform_type"),
+        }
+        for root in trace["roots"]
+        if root.get("category") == "bone_transform_root"
+    ]
+    compact = {
+        "source_property": prop_name,
+        "classification": trace["classification"],
+        "root_categories": trace["root_categories"],
+    }
+    if root_props:
+        compact["root_properties"] = root_props
+    if bone_roots:
+        compact["bone_roots"] = bone_roots
+    return compact
 
 
 def compact_driver_record(record):
@@ -854,6 +895,7 @@ def compact_source_refs(source_refs):
                     "variable": source_ref["variable_name"],
                     "type": source_ref["variable_type"],
                     "property": prop_name,
+                    "scope": scope_from_id_ref(source_ref["id"]),
                     "data_path": source_ref["data_path"],
                 }
                 for prop_name in props
@@ -1137,7 +1179,9 @@ def collect_bone_driver_cacheability_catalog(armature):
     entries = []
     channel_counts = Counter()
     source_kind_counts = Counter()
+    upstream_counts = Counter()
     decision_counts = Counter()
+    prop_index = build_prop_driver_index(armature)
     for owner_label, id_block in (
         ("object", armature),
         ("data", armature.data),
@@ -1156,10 +1200,38 @@ def collect_bone_driver_cacheability_catalog(armature):
             is_transform = channel in {"location", "rotation_euler", "rotation_quaternion", "scale"}
             is_constraint = channel == "constraints"
             props = sorted({variable.get("property") for variable in variables if variable.get("property")})
+            scoped_props = sorted(
+                {
+                    (variable.get("scope"), variable.get("property"))
+                    for variable in variables
+                    if variable.get("property")
+                },
+                key=lambda item: ((item[0] or ""), item[1].lower()),
+            )
+            upstream_traces = [
+                compact_upstream_trace(prop, prop_index, scope)
+                for scope, prop in scoped_props
+            ]
+            trace_classes = {trace["classification"] for trace in upstream_traces}
+            if source_kind in {"bone_transform_source", "mixed_bone_and_property"}:
+                upstream_classification = "dynamic_bone_driven"
+            elif "dynamic_bone_driven" in trace_classes:
+                upstream_classification = "dynamic_bone_driven"
+            elif "pose_corrective_prop_driven" in trace_classes:
+                upstream_classification = "pose_corrective_prop_driven"
+            elif "rig_setting_driven" in trace_classes:
+                upstream_classification = "rig_setting_driven"
+            elif trace_classes and trace_classes.issubset({"morph_or_expression_driven"}):
+                upstream_classification = "morph_or_expression_driven"
+            elif not trace_classes:
+                upstream_classification = "no_property_source"
+            else:
+                upstream_classification = "mixed_or_unknown"
+
             protected_props = [prop for prop in props if prop.startswith(("Mha", "pCTRL", "pJCM"))]
 
-            if source_kind in {"bone_transform_source", "mixed_bone_and_property"}:
-                decision = "dynamic_bone_source_keep_driver"
+            if upstream_classification == "dynamic_bone_driven":
+                decision = "dynamic_upstream_bone_transform_keep_driver"
             elif is_transform and pose_path["is_driver_bone"]:
                 decision = "cacheable_driver_bone_transform"
             elif is_constraint and protected_props:
@@ -1171,6 +1243,7 @@ def collect_bone_driver_cacheability_catalog(armature):
 
             channel_counts[channel] += 1
             source_kind_counts[source_kind] += 1
+            upstream_counts[upstream_classification] += 1
             decision_counts[decision] += 1
             entries.append(
                 {
@@ -1180,8 +1253,10 @@ def collect_bone_driver_cacheability_catalog(armature):
                     "array_index": fcurve.array_index,
                     "expression": fcurve.driver.expression,
                     "source_kind": source_kind,
+                    "upstream_classification": upstream_classification,
                     "decision": decision,
                     "properties": props,
+                    "upstream": upstream_traces,
                     "variables": variables,
                 }
             )
@@ -1192,6 +1267,7 @@ def collect_bone_driver_cacheability_catalog(armature):
             "driver_count": len(entries),
             "channel_counts": dict(channel_counts),
             "source_kind_counts": dict(source_kind_counts),
+            "upstream_classification_counts": dict(upstream_counts),
             "decision_counts": dict(decision_counts),
         },
         "drivers": sorted(
